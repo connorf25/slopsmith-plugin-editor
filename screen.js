@@ -1614,6 +1614,18 @@ function onKeyDown(e) {
         return;
     }
 
+    // Tempo-map mode: [ / ] change the selected measure's time signature.
+    if (S.tempoMapMode && (e.key === '[' || e.key === ']') && S.tempoSel >= 0
+            && !e.target.matches('input, select, textarea')) {
+        e.preventDefault();
+        const d = S.tempoSel;
+        if (S.beats[d] && S.beats[d].measure > 0) {
+            const cur = _tempoMeasureBeatCount(d);
+            _tempoSetBeatsPerMeasure(d, cur + (e.key === ']' ? 1 : -1));
+        }
+        return;
+    }
+
     // Block all note-mutating shortcuts while a take is active so mid-take
     // edits can't be silently overwritten when arr.notes = _recNotes on Stop.
     // Spacebar (above) is still allowed because it routes to editorTogglePlay
@@ -4962,6 +4974,11 @@ function _tempoMapOnContextMenu(e) {
         + `data-action="${action}">${label}</button>`;
     let html = '';
     if (onPole >= 0) {
+        const cur = _tempoMeasureBeatCount(onPole);
+        html += `<div class="px-3 py-1 text-xs text-gray-500">Measure: ${cur} beats</div>`;
+        if (cur < 16) html += mkBtn('tsplus', 'Add a beat (time signature +)');
+        if (cur > 1) html += mkBtn('tsminus', 'Remove a beat (time signature −)');
+        html += '<div class="border-t border-gray-700 my-1"></div>';
         html += mkBtn('delete', 'Delete sync point', 'text-red-400');
     } else {
         html += mkBtn('insert', 'Insert sync point here');
@@ -4970,8 +4987,11 @@ function _tempoMapOnContextMenu(e) {
     menu.querySelectorAll('[data-action]').forEach(btn => {
         btn.onclick = () => {
             hideContextMenu();
-            if (btn.dataset.action === 'delete') _tempoDeleteSyncPoint(onPole);
-            else if (btn.dataset.action === 'insert') _tempoInsertSyncPoint(xToTime(x));
+            const a = btn.dataset.action;
+            if (a === 'delete') _tempoDeleteSyncPoint(onPole);
+            else if (a === 'insert') _tempoInsertSyncPoint(xToTime(x));
+            else if (a === 'tsplus') _tempoSetBeatsPerMeasure(onPole, _tempoMeasureBeatCount(onPole) + 1);
+            else if (a === 'tsminus') _tempoSetBeatsPerMeasure(onPole, _tempoMeasureBeatCount(onPole) - 1);
         };
     });
     menu.style.left = e.clientX + 'px';
@@ -5048,6 +5068,44 @@ function _tempoDeleteSyncPoint(beatIdx) {
     S.history.exec(new TempoGridCmd(oldBeats, newBeats, 'delete'));
     S.tempoSel = -1;
     draw();
+}
+
+// ── Time signature ──────────────────────────────────────────────────
+//
+// Re-subdivide the measure starting at downbeat `d` to `newCount`
+// beats. The measure's [downbeat, next-downbeat] time span is fixed,
+// so only the interior grid lines move — note times are untouched.
+
+function _tempoSetBeatsPerMeasure(d, newCount) {
+    newCount = Math.max(1, Math.min(16, Math.round(newCount)));
+    const beats = S.beats || [];
+    if (d < 0 || d >= beats.length || beats[d].measure <= 0) return;
+    let ndb = -1;
+    for (let i = d + 1; i < beats.length; i++) { if (beats[i].measure > 0) { ndb = i; break; } }
+    const startT = beats[d].time;
+    let endT, tailIdx;
+    if (ndb >= 0) { endT = beats[ndb].time; tailIdx = ndb; }
+    else { endT = S.duration || beats[beats.length - 1].time; tailIdx = beats.length; }
+    if (endT <= startT) return;
+    const head = beats.slice(0, d + 1).map(b => ({ ...b }));
+    const tail = beats.slice(tailIdx).map(b => ({ ...b }));
+    const interior = [];
+    for (let k = 1; k < newCount; k++) {
+        interior.push({ time: _r3(startT + (endT - startT) * k / newCount), measure: -1 });
+    }
+    const newBeats = head.concat(interior, tail);
+    _tempoRenumberMeasures(newBeats);
+    S.history.exec(new TempoGridCmd(beats.map(b => ({ ...b })), newBeats, 'timesig'));
+    draw();
+}
+
+// Beats currently in the measure starting at downbeat index `d`.
+function _tempoMeasureBeatCount(d) {
+    const beats = S.beats || [];
+    for (let i = d + 1; i < beats.length; i++) {
+        if (beats[i].measure > 0) return i - d;
+    }
+    return beats.length - d;  // last measure
 }
 
 // Undo command for insert/delete/time-signature edits — these only
