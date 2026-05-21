@@ -35,6 +35,56 @@ _DRUM_TAB_ABSENT = object()
 _sessions = None
 
 
+def _mix_stems_for_editor(stem_paths: list, dest) -> bool:
+    """Mix multiple per-instrument stems into one Ogg file for editor
+    playback. A stem-split sloppak has no `full` mix on disk, so without
+    this the editor would play only the first stem (a lone instrument).
+
+    Cached: skips the re-encode when `dest` is already newer than every
+    input stem. Returns True when `dest` holds a usable mixed file.
+    """
+    if len(stem_paths) < 2:
+        return False
+    try:
+        if dest.exists():
+            dmt = dest.stat().st_mtime
+            if all(dmt >= p.stat().st_mtime for p in stem_paths):
+                return True
+    except OSError:
+        pass
+
+    ffmpeg = None
+    try:
+        from lib.audio import _ffmpeg_cmd
+        ffmpeg = _ffmpeg_cmd()
+    except Exception:
+        ffmpeg = None
+    if not ffmpeg:
+        ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+
+    inputs = []
+    for p in stem_paths:
+        inputs += ["-i", str(p)]
+    # normalize=0: sum the stems without amix's default ÷N attenuation —
+    # demucs stems sum back to ~the original mix level.
+    base = [ffmpeg, "-y", *inputs,
+            "-filter_complex", f"amix=inputs={len(stem_paths)}:normalize=0"]
+    # Prefer libvorbis; fall back to the built-in encoder if the ffmpeg
+    # build lacks it (mirrors lib.audio._ffmpeg_wav_to_ogg).
+    for enc in (["-c:a", "libvorbis", "-q:a", "5"],
+                ["-c:a", "vorbis", "-strict", "experimental", "-q:a", "5"]):
+        try:
+            r = subprocess.run(base + enc + [str(dest)],
+                               capture_output=True, timeout=180)
+            if r.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+                return True
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return False
+
+
 def setup(app, context):
     config_dir = context["config_dir"]
     get_dlc_dir = context["get_dlc_dir"]
@@ -406,10 +456,13 @@ def setup(app, context):
             for entry in (loaded.manifest.get("arrangements", []) or []):
                 arrangement_ids.append(entry.get("id", ""))
 
-            # Pick an audio URL: prefer the "full" stem, else the first stem.
+            # Pick the audio for editor playback. A freshly-converted
+            # sloppak has one `full` stem — use it directly. A stem-split
+            # sloppak has no `full` (Demucs removes full.ogg), only
+            # per-instrument stems; those must be MIXED back together,
+            # otherwise the editor would play just one instrument.
             audio_url = None
             audio_file = None
-            stem_path = None
 
             def _safe_stem_path(stem_entry: dict) -> "Path | None":
                 """Resolve stem file path and reject traversal outside source_dir."""
@@ -424,24 +477,38 @@ def setup(app, context):
                     return None
                 return candidate if candidate.exists() else None
 
-            for s in loaded.stems:
-                if s.get("id") == "full":
-                    stem_path = _safe_stem_path(s)
-                    break
-            if stem_path is None and loaded.stems:
-                stem_path = _safe_stem_path(loaded.stems[0])
-            if stem_path and stem_path.exists():
-                # Same basename-collision class as session_id: nested paths
-                # like `foo/bar.psarc` and `baz/bar.sloppak` both reduce
-                # to stem "bar". Use a sanitised full path so two browser
-                # tabs loading distinct songs don't overwrite each other's
-                # `editor_audio_*` file under STATIC_DIR.
-                audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
-                ext = stem_path.suffix
-                dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
-                shutil.copy2(stem_path, dest)
-                audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
-                audio_file = str(stem_path)
+            # Same basename-collision class as session_id: nested paths
+            # like `foo/bar.psarc` and `baz/bar.sloppak` both reduce to
+            # stem "bar". Use a sanitised full path so two browser tabs
+            # loading distinct songs don't overwrite each other's
+            # `editor_audio_*` file under STATIC_DIR.
+            audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+
+            full_stem = next((s for s in loaded.stems if s.get("id") == "full"), None)
+            if full_stem is not None:
+                sp = _safe_stem_path(full_stem)
+                if sp and sp.exists():
+                    ext = sp.suffix
+                    dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
+                    shutil.copy2(sp, dest)
+                    audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
+                    audio_file = str(sp)
+            else:
+                # Stem-split sloppak — mix every per-instrument stem.
+                stem_paths = [p for p in (_safe_stem_path(s) for s in loaded.stems)
+                              if p is not None]
+                if len(stem_paths) == 1:
+                    sp = stem_paths[0]
+                    ext = sp.suffix
+                    dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
+                    shutil.copy2(sp, dest)
+                    audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
+                    audio_file = str(sp)
+                elif len(stem_paths) > 1:
+                    dest = STORAGE_DIR / f"editor_audio_{audio_id}.ogg"
+                    if _mix_stems_for_editor(stem_paths, dest):
+                        audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}.ogg"
+                        audio_file = str(dest)
 
             result = _song_to_dict(song, audio_url)
             result["format"] = "sloppak"
