@@ -509,6 +509,16 @@ def setup(app, context):
                     if _mix_stems_for_editor(stem_paths, dest):
                         audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}.ogg"
                         audio_file = str(dest)
+                    else:
+                        # ffmpeg missing or the mix failed — fall back to a
+                        # single stem so the editor still has playable audio
+                        # (the pre-fix behavior). One instrument beats none.
+                        sp = stem_paths[0]
+                        ext = sp.suffix
+                        fdest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
+                        shutil.copy2(sp, fdest)
+                        audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
+                        audio_file = str(sp)
 
             result = _song_to_dict(song, audio_url)
             result["format"] = "sloppak"
