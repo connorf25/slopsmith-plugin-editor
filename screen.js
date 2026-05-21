@@ -89,6 +89,17 @@ const S = {
     drumEditMode: false,
     drumSel: new Set(),
 
+    // Tempo Map mode — EOF-style: drag the song-wide beat grid's measure
+    // downbeats ("sync points") to fit it to the audio; BPM is derived
+    // from sync-point spacing. tempoSel/tempoHover index into S.beats.
+    // tempoRideScope decides which notes re-time when the grid moves:
+    // 'drum' (only drum_tab hits) or 'all' (every arrangement). Hydrated
+    // from localStorage on init. Mode resets on song load.
+    tempoMapMode: false,
+    tempoSel: -1,
+    tempoHover: -1,
+    tempoRideScope: 'drum',
+
     // View
     scrollX: 0,   // seconds
     zoom: 120,     // px per second
@@ -440,6 +451,15 @@ function draw() {
     // is not in S.arrangements[]).
     if (S.drumEditMode && S.drumTab) {
         try { _drumEditorDraw(w, h); }
+        finally { ctx.restore(); }
+        return;
+    }
+
+    // Tempo Map mode forks to a sync-point editor view. Like drum mode it
+    // skips the guitar/keys draw chain — it only needs the waveform + the
+    // song-wide beat grid, not any arrangement's notes.
+    if (S.tempoMapMode) {
+        try { _tempoMapDraw(w, h); }
         finally { ctx.restore(); }
         return;
     }
@@ -1189,6 +1209,12 @@ function onMouseDown(e) {
         return;
     }
 
+    // Tempo Map mode hijacks the left click for sync-point editing.
+    if (S.tempoMapMode) {
+        _tempoMapOnMouseDown(e, x, y);
+        return;
+    }
+
     // Left button
     if (y < WAVEFORM_H) {
         // Block waveform seek while recording: restarting the AudioBufferSourceNode
@@ -1297,6 +1323,13 @@ function _onMouseMoveBody(e, x, y, L) {
         // irrelevant and shows misleading resize cursors over the drum grid.
         if (S.drumEditMode && S.drumTab) {
             if (canvas) canvas.style.cursor = '';
+            return;
+        }
+        // Tempo-map mode: highlight the sync-point pole under the cursor.
+        if (S.tempoMapMode) {
+            const hit = _tempoSyncAtX(x, y);
+            if (hit !== S.tempoHover) { S.tempoHover = hit; draw(); }
+            if (canvas) canvas.style.cursor = hit >= 0 ? 'ew-resize' : '';
             return;
         }
         if (canvas && y >= WAVEFORM_H && y < WAVEFORM_H + L * LANE_H) {
@@ -1444,7 +1477,7 @@ function onMouseUp(e) {
 }
 
 function onDblClick(e) {
-    if (S.drumEditMode) return;  // drum-edit mode handles all canvas interaction
+    if (S.drumEditMode || S.tempoMapMode) return;  // those modes own canvas interaction
     if (_recState === 'recording') return;  // block note addition during active take
     const { x, y } = getMousePos(e);
     const keysMode = isKeysMode();
@@ -1488,6 +1521,7 @@ function onWheel(e) {
 
 function onContextMenu(e) {
     if (S.drumEditMode) { e.preventDefault(); return; }  // drum-edit mode handles interaction
+    if (S.tempoMapMode) { e.preventDefault(); _tempoMapOnContextMenu(e); return; }
     e.preventDefault();
     const { x, y } = getMousePos(e);
 
@@ -1629,6 +1663,8 @@ function onKeyDown(e) {
                 draw();
                 return;
             }
+            // Tempo-map mode has no note selection — Ctrl+A is inert.
+            if (S.tempoMapMode) return;
             const nn = notes();
             for (let i = 0; i < nn.length; i++) S.sel.add(i);
             draw();
@@ -1640,7 +1676,7 @@ function onKeyDown(e) {
         // drum-edit mode the canvas shows the drum grid, so a paste here
         // would mutate the hidden arrangement with no visual feedback —
         // skip both shortcuts while drum-edit mode is active.
-        if (!S.drumEditMode && S.sel.size && !e.target.matches('input, select, textarea')) {
+        if (!S.drumEditMode && !S.tempoMapMode && S.sel.size && !e.target.matches('input, select, textarea')) {
             e.preventDefault();
             const nn = notes();
             const selNotes = [...S.sel].map(i => nn[i]);
@@ -1660,7 +1696,7 @@ function onKeyDown(e) {
         }
     }
     if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
-        if (!S.drumEditMode && S.clipboard && S.clipboard.notes.length && !e.target.matches('input, select, textarea')) {
+        if (!S.drumEditMode && !S.tempoMapMode && S.clipboard && S.clipboard.notes.length && !e.target.matches('input, select, textarea')) {
             e.preventDefault();
             const pasteTime = S.cursorTime;
             const newNotes = S.clipboard.notes.map(n => ({
@@ -2010,6 +2046,11 @@ async function loadCDLC(filename) {
         // selection into a sloppak whose hits[] is different.
         S.drumEditMode = false;
         S.drumSel = new Set();
+        // Exit tempo-map mode too — its selection indexes into the old
+        // song's beats[].
+        S.tempoMapMode = false;
+        S.tempoSel = -1;
+        S.tempoHover = -1;
         S.currentArr = 0;
         S.sel.clear();
         S.scrollX = 0;
@@ -3223,6 +3264,12 @@ function init() {
     if (!canvas) return;
     ctx = canvas.getContext('2d');
     S.history = new EditHistory();
+
+    // Restore the Tempo Map "apply to" scope preference.
+    try {
+        const sc = localStorage.getItem('editor-tempomap-scope');
+        if (sc === 'drum' || sc === 'all') S.tempoRideScope = sc;
+    } catch (_) { /* localStorage unavailable */ }
 
     canvas.addEventListener('mousedown', onMouseDown);
     document.addEventListener('mousemove', onMouseMove);
@@ -4516,6 +4563,309 @@ function _drumEditorDraw(w, h) {
     ctx.fillText(hud, LABEL_W + 6, WAVEFORM_H + _drumPieceCount() * DRUM_LANE_H + 6);
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Tempo Map editor — EOF-style sync-point editing of the song-wide
+// beat grid (S.beats). Tempo is implicit: BPM is derived from the
+// spacing between measure downbeats.
+// ════════════════════════════════════════════════════════════════════
+
+const TEMPO_HUD_H = 26;        // bottom strip height in tempo-map mode
+const TEMPO_POLE_HALF = 6;     // sync-point pole grab half-width (px)
+
+// Derive per-measure metrics from S.beats. A measure spans from one
+// downbeat (`measure > 0`) to the next; the beats between them (the
+// downbeat itself + its sub-beats) give the implicit time signature,
+// and BPM = beats / measureDuration * 60.
+// Returns [{k, i, time, measure, nextI, nextTime, beats, bpm, isLast}],
+// where `i` is the S.beats index of the downbeat.
+function _tempoMeasures() {
+    const beats = S.beats || [];
+    const dbIdx = [];
+    for (let i = 0; i < beats.length; i++) {
+        if (beats[i].measure > 0) dbIdx.push(i);
+    }
+    const out = [];
+    for (let k = 0; k < dbIdx.length; k++) {
+        const i = dbIdx[k];
+        const nextI = (k + 1 < dbIdx.length) ? dbIdx[k + 1] : null;
+        const time = beats[i].time;
+        let beatCount, bpm, nextTime;
+        if (nextI !== null) {
+            nextTime = beats[nextI].time;
+            beatCount = nextI - i;
+            const dur = nextTime - time;
+            bpm = dur > 1e-6 ? (beatCount / dur) * 60 : 0;
+        } else {
+            // Last measure has no closing downbeat — reuse the previous
+            // measure's metrics so the display value is stable.
+            nextTime = null;
+            const prev = out[out.length - 1];
+            beatCount = prev ? prev.beats : Math.max(1, beats.length - 1 - i);
+            bpm = prev ? prev.bpm : 0;
+        }
+        out.push({
+            k, i, time, measure: beats[i].measure,
+            nextI, nextTime, beats: beatCount, bpm, isLast: nextI === null,
+        });
+    }
+    return out;
+}
+
+function _tempoMapDraw(w, h) {
+    const visibleStart = S.scrollX - 0.5;
+    const visibleEnd = S.scrollX + (w - LABEL_W) / S.zoom + 0.5;
+    const gridBottom = h - TEMPO_HUD_H;
+
+    drawWaveform(w);
+
+    // Grid region background.
+    ctx.fillStyle = '#0c0c1c';
+    ctx.fillRect(LABEL_W, WAVEFORM_H, w - LABEL_W, gridBottom - WAVEFORM_H);
+
+    if (!S.beats || S.beats.length < 2) {
+        ctx.fillStyle = '#64748b';
+        ctx.font = '12px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('No beat grid on this song — nothing to tempo-map.',
+            LABEL_W + 12, WAVEFORM_H + 30);
+        return;
+    }
+
+    // Beat grid lines (downbeats brighter than sub-beats).
+    for (const b of S.beats) {
+        if (b.time < visibleStart || b.time > visibleEnd) continue;
+        const x = timeToX(b.time);
+        if (x < LABEL_W || x > w) continue;
+        const meas = b.measure > 0;
+        ctx.strokeStyle = meas ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.04)';
+        ctx.lineWidth = meas ? 1 : 0.5;
+        ctx.beginPath();
+        ctx.moveTo(x, WAVEFORM_H);
+        ctx.lineTo(x, gridBottom);
+        ctx.stroke();
+    }
+
+    // Measures: per-measure labels + draggable sync-point poles.
+    const measures = _tempoMeasures();
+    for (const m of measures) {
+        const x = timeToX(m.time);
+
+        // Per-measure label, centred in the span (only if wide enough).
+        if (m.nextTime !== null) {
+            const xa = timeToX(m.time), xb = timeToX(m.nextTime);
+            const xMid = (xa + xb) / 2;
+            if (xb - xa > 46 && xMid > LABEL_W && xMid < w) {
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                ctx.fillStyle = '#cbd5e1';
+                ctx.font = 'bold 10px monospace';
+                ctx.fillText(`M${m.measure}`, xMid, WAVEFORM_H + 4);
+                ctx.fillStyle = m.isLast ? '#64748b' : '#fbbf24';
+                ctx.font = '10px monospace';
+                ctx.fillText(`${m.bpm.toFixed(2)} BPM`, xMid, WAVEFORM_H + 17);
+                ctx.fillStyle = '#64748b';
+                ctx.font = '9px monospace';
+                ctx.fillText(`${m.beats}/4`, xMid, WAVEFORM_H + 30);
+            }
+        }
+
+        // Sync-point pole + grab handle.
+        if (x >= LABEL_W && x <= w) {
+            const sel = (m.i === S.tempoSel);
+            const hov = (m.i === S.tempoHover);
+            if (sel) {
+                ctx.strokeStyle = 'rgba(251,191,36,0.25)';
+                ctx.lineWidth = 7;
+                ctx.beginPath();
+                ctx.moveTo(x, WAVEFORM_H);
+                ctx.lineTo(x, gridBottom);
+                ctx.stroke();
+            }
+            ctx.strokeStyle = sel ? '#fbbf24' : hov ? '#93c5fd' : '#64748b';
+            ctx.lineWidth = sel ? 3 : 2;
+            ctx.beginPath();
+            ctx.moveTo(x, WAVEFORM_H);
+            ctx.lineTo(x, gridBottom);
+            ctx.stroke();
+            ctx.fillStyle = sel ? '#fbbf24' : hov ? '#93c5fd' : '#94a3b8';
+            ctx.fillRect(x - TEMPO_POLE_HALF, WAVEFORM_H, TEMPO_POLE_HALF * 2, 13);
+            ctx.fillStyle = '#0c0c1c';
+            ctx.font = 'bold 9px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillText('↔', x, WAVEFORM_H + 2);
+        }
+    }
+
+    // Playback cursor.
+    if (S.cursorTime >= visibleStart && S.cursorTime <= visibleEnd) {
+        const cx = timeToX(S.cursorTime);
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cx, WAVEFORM_H);
+        ctx.lineTo(cx, gridBottom);
+        ctx.stroke();
+    }
+
+    // HUD strip.
+    ctx.fillStyle = '#08081a';
+    ctx.fillRect(0, gridBottom, w, TEMPO_HUD_H);
+    const hudY = gridBottom + TEMPO_HUD_H / 2;
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(
+        `Tempo Map — ${measures.length} measures · drag a pole to retime · `
+        + `right-click: insert/delete · [ ]: time signature`,
+        LABEL_W + 6, hudY);
+}
+
+// ── Tempo Map toolbar toggle ────────────────────────────────────────
+
+function _ensureTempoMapButton() {
+    let btn = document.getElementById('editor-tempo-map-btn');
+    if (!btn) {
+        const anchor = document.getElementById('editor-save-btn');
+        if (!anchor) return null;
+        btn = document.createElement('button');
+        btn.id = 'editor-tempo-map-btn';
+        btn.type = 'button';
+        btn.textContent = '🎵 Tempo Map';
+        btn.className = 'px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs font-medium hidden';
+        btn.title = 'Open the EOF-style tempo-map editor';
+        btn.onclick = () => {
+            S.tempoMapMode = !S.tempoMapMode;
+            S.tempoSel = -1;
+            S.tempoHover = -1;
+            if (S.tempoMapMode) {
+                // Tempo and drum modes are mutually exclusive.
+                S.drumEditMode = false;
+                S.drumSel = new Set();
+                hideContextMenu();
+                hideAddNote();
+                S.sel.clear();
+            }
+            _refreshTempoMapButton();
+            _refreshDrumEditButton();
+            draw();
+        };
+        anchor.parentNode.insertBefore(btn, anchor.nextSibling);
+    }
+    return btn;
+}
+
+let _tempoMapBtnState = '';  // memoized signature; updates only on change
+
+function _refreshTempoMapButton() {
+    const btn = _ensureTempoMapButton();
+    if (!btn) return;
+    // The grid is song-wide and round-trips through PSARC + sloppak, so
+    // the button is NOT format-gated — only a beat grid is required.
+    const hasGrid = !!(S.beats && S.beats.length >= 2);
+    const sig = `${!!S.sessionId}|${hasGrid}|${!!S.tempoMapMode}`;
+    if (sig === _tempoMapBtnState) return;
+    _tempoMapBtnState = sig;
+    btn.classList.toggle('hidden', !S.sessionId || !hasGrid);
+    if (S.tempoMapMode) {
+        btn.textContent = '🎸 Back to Notes';
+        btn.classList.add('bg-amber-600', 'hover:bg-amber-500');
+        btn.classList.remove('bg-dark-600', 'hover:bg-dark-500');
+    } else {
+        btn.textContent = '🎵 Tempo Map';
+        btn.classList.remove('bg-amber-600', 'hover:bg-amber-500');
+        btn.classList.add('bg-dark-600', 'hover:bg-dark-500');
+    }
+}
+
+// ── Scope toggle — a DOM control overlaid on the canvas, shown only
+// in tempo-map mode. (DOM rather than canvas-drawn: a clickable
+// control is more robust and gets native hit-testing for free.)
+
+function _ensureTempoScopeToggle() {
+    let el = document.getElementById('editor-tempo-scope');
+    if (!el) {
+        const wrap = document.getElementById('editor-canvas-wrap');
+        if (!wrap) return null;
+        el = document.createElement('div');
+        el.id = 'editor-tempo-scope';
+        el.className = 'absolute hidden items-center gap-1 px-2 py-1 '
+            + 'bg-dark-800 border border-gray-700 rounded text-xs z-10';
+        el.style.right = '10px';
+        el.style.bottom = '8px';
+        el.innerHTML =
+            '<span class="text-gray-500 mr-1">Apply tempo edits to:</span>'
+            + '<button type="button" data-scope="drum" class="px-2 py-0.5 rounded"></button>'
+            + '<button type="button" data-scope="all" class="px-2 py-0.5 rounded"></button>';
+        el.querySelectorAll('button').forEach(b => {
+            b.textContent = b.dataset.scope === 'drum' ? 'Drum tab' : 'All instruments';
+            b.onclick = () => {
+                S.tempoRideScope = b.dataset.scope;
+                try {
+                    localStorage.setItem('editor-tempomap-scope', S.tempoRideScope);
+                } catch (_) { /* localStorage unavailable */ }
+                _refreshTempoScopeToggle();
+                draw();
+            };
+        });
+        wrap.appendChild(el);
+    }
+    return el;
+}
+
+function _refreshTempoScopeToggle() {
+    const el = _ensureTempoScopeToggle();
+    if (!el) return;
+    el.classList.toggle('hidden', !S.tempoMapMode);
+    el.classList.toggle('flex', !!S.tempoMapMode);
+    el.querySelectorAll('button').forEach(b => {
+        const active = b.dataset.scope === S.tempoRideScope;
+        b.className = 'px-2 py-0.5 rounded ' + (active
+            ? 'bg-amber-600 text-white font-medium'
+            : 'bg-dark-600 text-gray-400 hover:bg-dark-500');
+    });
+}
+
+// ── Tempo Map interaction ───────────────────────────────────────────
+
+// Return the S.beats index of the sync-point pole (a downbeat) nearest
+// to canvas x within the pole grab zone, or -1. y must be inside the
+// grid region.
+function _tempoSyncAtX(x, y) {
+    if (!canvas) return -1;
+    const gridBottom = canvas.height / DPR - TEMPO_HUD_H;
+    if (y < WAVEFORM_H || y > gridBottom) return -1;
+    let best = -1, bestDist = TEMPO_POLE_HALF + 2;
+    const beats = S.beats || [];
+    for (let i = 0; i < beats.length; i++) {
+        if (beats[i].measure <= 0) continue;
+        const d = Math.abs(timeToX(beats[i].time) - x);
+        if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+}
+
+function _tempoMapOnMouseDown(e, x, y) {
+    if (!canvas) return;
+
+    // Waveform-area click sets the playback cursor.
+    if (y < WAVEFORM_H) {
+        S.cursorTime = Math.max(0, xToTime(x));
+        if (S.playing) { stopPlayback(); startPlayback(); }
+        draw();
+        return;
+    }
+
+    // Click a sync-point pole to select it. Phase 2 starts the drag here.
+    S.tempoSel = _tempoSyncAtX(x, y);
+    draw();
+}
+
+// Phase 3 wires the insert / delete sync-point context menu here.
+function _tempoMapOnContextMenu(e) { /* no-op until phase 3 */ }
+
 // Add a hit at the snap-aligned time on the lane under (x, y). Returns
 // true if added (false if click was outside the lane grid).
 function _drumEditorAddHit(x, y) {
@@ -4735,7 +5085,10 @@ function _ensureDrumEditButton() {
             hideContextMenu();
             hideAddNote();
             S.sel.clear();
+            // Tempo and drum modes are mutually exclusive.
+            if (S.drumEditMode) { S.tempoMapMode = false; S.tempoSel = -1; }
             _refreshDrumEditButton();
+            _refreshTempoMapButton();
             draw();
         };
         drumsBtn.parentNode.insertBefore(btn, drumsBtn.nextSibling);
@@ -4781,6 +5134,8 @@ const _checkBtnInterval = setInterval(() => {
 const _origDraw = draw;
 draw = function () {
     _refreshDrumEditButton();
+    _refreshTempoMapButton();
+    _refreshTempoScopeToggle();
     return _origDraw.apply(this, arguments);
 };
 
