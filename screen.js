@@ -4827,6 +4827,10 @@ function _ensureTempoMapButton() {
         btn.className = 'px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs font-medium hidden';
         btn.title = 'Open the EOF-style tempo-map editor';
         btn.onclick = () => {
+            // Abandon any in-progress sync-point drag — leaving it live
+            // would let a later mouseup commit a tempo edit after the
+            // mode has been switched off.
+            if (S.drag && S.drag.type === 'tempo-sync') S.drag = null;
             S.tempoMapMode = !S.tempoMapMode;
             S.tempoSel = -1;
             S.tempoHover = -1;
@@ -5233,10 +5237,24 @@ function _makeTimeRemap(oldBeats, newBeats) {
 
 const _r3 = v => Math.round(v * 1000) / 1000;
 
+// The arrangements an 'all'-scope tempo edit re-times. PSARC saves only
+// persist the active arrangement (_buildSaveBody ships body.arrangements
+// for sloppak only), so re-timing a non-active arrangement on a PSARC
+// would be silently lost on reload — limit PSARC to the active one.
+// A TempoMapCmd freezes this list at construction so capture / remap /
+// restore all agree even if the user switches arrangements later.
+function _tempoRetimeArrangements() {
+    if (S.format === 'psarc') {
+        const a = S.arrangements[S.currentArr];
+        return a ? [a] : [];
+    }
+    return (S.arrangements || []).filter(Boolean);
+}
+
 // Apply `remap` to every timed object the scope re-times. Always
-// re-times drum_tab hits; 'all' additionally re-times every
-// arrangement's notes/chords/anchors/handshapes/phrases + sections.
-function _applyTempoRemap(remap, scope) {
+// re-times drum_tab hits; 'all' additionally re-times the given
+// arrangements' notes/chords/anchors/handshapes/phrases + sections.
+function _applyTempoRemap(remap, scope, arrs) {
     if (S.drumTab && Array.isArray(S.drumTab.hits)) {
         for (const h of S.drumTab.hits) {
             if (typeof h.t === 'number') h.t = _r3(remap(h.t));
@@ -5252,14 +5270,7 @@ function _applyTempoRemap(remap, scope) {
             o.sustain = Math.max(0, _r3(remap(oldT + o.sustain) - remap(oldT)));
         }
     };
-    // PSARC saves only persist the active arrangement (_buildSaveBody
-    // ships body.arrangements for sloppak only). Re-timing a non-active
-    // arrangement on a PSARC would be silently lost on reload — so on
-    // PSARC, 'all' scope is limited to the arrangement being edited.
-    const retimeArrs = (S.format === 'psarc' && S.arrangements[S.currentArr])
-        ? [S.arrangements[S.currentArr]]
-        : (S.arrangements || []);
-    for (const arr of retimeArrs) {
+    for (const arr of (arrs || [])) {
         if (!arr) continue;
         for (const n of (arr.notes || [])) remapNote(n);
         for (const ch of (arr.chords || [])) {
@@ -5284,14 +5295,15 @@ function _applyTempoRemap(remap, scope) {
 }
 
 // Snapshot the exact times the scope re-times, so undo restores them
-// without inverse-remap rounding drift.
-function _captureScopedTimes(scope) {
+// without inverse-remap rounding drift. `arrs` is the frozen list the
+// owning TempoMapCmd will also remap and restore.
+function _captureScopedTimes(scope, arrs) {
     const snap = { drum: null, arr: null, sections: null };
     if (S.drumTab && Array.isArray(S.drumTab.hits)) {
         snap.drum = S.drumTab.hits.map(h => h.t);
     }
     if (scope === 'all') {
-        snap.arr = (S.arrangements || []).map(arr => {
+        snap.arr = (arrs || []).map(arr => {
             if (!arr) return null;
             return {
                 notes: (arr.notes || []).map(n => ({ time: n.time, sustain: n.sustain })),
@@ -5311,7 +5323,7 @@ function _captureScopedTimes(scope) {
     return snap;
 }
 
-function _restoreScopedTimes(snap, scope) {
+function _restoreScopedTimes(snap, scope, arrs) {
     if (snap.drum && S.drumTab && Array.isArray(S.drumTab.hits)) {
         const hits = S.drumTab.hits;
         for (let i = 0; i < hits.length && i < snap.drum.length; i++) {
@@ -5319,8 +5331,9 @@ function _restoreScopedTimes(snap, scope) {
         }
     }
     if (scope === 'all' && snap.arr) {
-        for (let ai = 0; ai < (S.arrangements || []).length; ai++) {
-            const arr = S.arrangements[ai], a = snap.arr[ai];
+        const list = arrs || [];
+        for (let ai = 0; ai < list.length; ai++) {
+            const arr = list[ai], a = snap.arr[ai];
             if (!arr || !a) continue;
             (arr.notes || []).forEach((n, i) => {
                 if (a.notes[i]) { n.time = a.notes[i].time; n.sustain = a.notes[i].sustain; }
@@ -5356,8 +5369,10 @@ function _restoreScopedTimes(snap, scope) {
     }
 }
 
-// Undo command for one tempo-map edit. Captures the scope at
-// construction so undo stays consistent if the toggle is flipped later.
+// Undo command for one tempo-map edit. Captures the scope AND the exact
+// arrangement objects it re-times at first exec, so capture / remap /
+// restore stay consistent even if the scope toggle is flipped or the
+// user switches arrangements between the edit and an undo.
 class TempoMapCmd {
     constructor(oldBeats, newBeats, label) {
         this.oldBeats = oldBeats.map(b => ({ ...b }));
@@ -5365,15 +5380,20 @@ class TempoMapCmd {
         this.scope = S.tempoRideScope;
         this.label = label || 'tempo';
         this.before = null;
+        this.arrs = null;
     }
     exec() {
-        if (!this.before) this.before = _captureScopedTimes(this.scope);
+        if (!this.before) {
+            this.arrs = (this.scope === 'all') ? _tempoRetimeArrangements() : [];
+            this.before = _captureScopedTimes(this.scope, this.arrs);
+        }
         S.beats = this.newBeats.map(b => ({ ...b }));
-        _applyTempoRemap(_makeTimeRemap(this.oldBeats, this.newBeats), this.scope);
+        _applyTempoRemap(_makeTimeRemap(this.oldBeats, this.newBeats),
+                         this.scope, this.arrs);
     }
     rollback() {
         S.beats = this.oldBeats.map(b => ({ ...b }));
-        _restoreScopedTimes(this.before, this.scope);
+        _restoreScopedTimes(this.before, this.scope, this.arrs);
     }
 }
 
@@ -5596,8 +5616,13 @@ function _ensureDrumEditButton() {
             hideContextMenu();
             hideAddNote();
             S.sel.clear();
-            // Tempo and drum modes are mutually exclusive.
-            if (S.drumEditMode) { S.tempoMapMode = false; S.tempoSel = -1; }
+            // Tempo and drum modes are mutually exclusive; abandon any
+            // in-progress sync drag so a later mouseup can't commit it.
+            if (S.drumEditMode) {
+                S.tempoMapMode = false;
+                S.tempoSel = -1;
+                if (S.drag && S.drag.type === 'tempo-sync') S.drag = null;
+            }
             _refreshDrumEditButton();
             _refreshTempoMapButton();
             draw();
