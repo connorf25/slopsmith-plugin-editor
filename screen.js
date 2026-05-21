@@ -1354,6 +1354,12 @@ function _onMouseMoveBody(e, x, y, L) {
         return;
     }
 
+    // Tempo-map drag: re-space the two measures around the dragged pole.
+    if (S.drag.type === 'tempo-sync') {
+        _tempoMapOnDragMove(x);
+        return;
+    }
+
     if (S.drag.type === 'select') {
         S.drag.curX = x;
         S.drag.curY = y;
@@ -1416,6 +1422,11 @@ function onMouseUp(e) {
     // PR (would need a DrumMoveCmd that captures origTimes/origPieces).
     if (S.drag.type === 'drum-move') {
         _drumEditorOnDragEnd();
+        return;
+    }
+
+    if (S.drag.type === 'tempo-sync') {
+        _tempoMapOnDragEnd();
         return;
     }
 
@@ -4572,6 +4583,53 @@ function _drumEditorDraw(w, h) {
 const TEMPO_HUD_H = 26;        // bottom strip height in tempo-map mode
 const TEMPO_POLE_HALF = 6;     // sync-point pole grab half-width (px)
 
+// Dimmed, non-interactive reference layer for tempo-map mode: the
+// current arrangement's notes (spread by string) and the drum_tab
+// hits (spread by piece), plotted at their absolute times.
+function _tempoDrawReferenceNotes(w, gridBottom, visStart, visEnd) {
+    const bandTop = WAVEFORM_H + 46;
+    const bandBot = gridBottom - 8;
+    if (bandBot <= bandTop) return;
+    const bandMid = (bandTop + bandBot) / 2;
+    const REF_R = 4;  // reference-dot radius
+
+    const dot = (x, y) => {
+        ctx.beginPath();
+        ctx.arc(x, y, REF_R, 0, Math.PI * 2);
+        ctx.fill();
+    };
+
+    const arr = S.arrangements[S.currentArr];
+    if (arr) {
+        const L = Math.max(1, lanes());
+        ctx.fillStyle = 'rgba(130,170,255,0.55)';
+        const plot = (t, str) => {
+            if (typeof t !== 'number' || t < visStart || t > visEnd) return;
+            const x = timeToX(t);
+            if (x < LABEL_W || x > w) return;
+            const frac = L > 1 ? ((str || 0) % L) / (L - 1) : 0.5;
+            dot(x, bandTop + REF_R + frac * (bandMid - bandTop - 2 * REF_R - 4));
+        };
+        for (const n of (arr.notes || [])) plot(n.time, n.string);
+        for (const ch of (arr.chords || [])) {
+            for (const cn of (ch.notes || [])) plot(cn.time != null ? cn.time : ch.time, cn.string);
+        }
+    }
+
+    if (S.drumTab && Array.isArray(S.drumTab.hits)) {
+        const pc = Math.max(1, _drumPieceCount());
+        ctx.fillStyle = 'rgba(251,191,36,0.60)';
+        for (const hit of S.drumTab.hits) {
+            if (typeof hit.t !== 'number' || hit.t < visStart || hit.t > visEnd) continue;
+            const x = timeToX(hit.t);
+            if (x < LABEL_W || x > w) continue;
+            const pi = DRUM_PIECE_ORDER.indexOf(hit.p);
+            const frac = (pi >= 0 && pc > 1) ? pi / (pc - 1) : 0.5;
+            dot(x, bandMid + REF_R + 4 + frac * (bandBot - bandMid - 2 * REF_R - 4));
+        }
+    }
+}
+
 // Derive per-measure metrics from S.beats. A measure spans from one
 // downbeat (`measure > 0`) to the next; the beats between them (the
 // downbeat itself + its sub-beats) give the implicit time signature,
@@ -4645,6 +4703,11 @@ function _tempoMapDraw(w, h) {
         ctx.lineTo(x, gridBottom);
         ctx.stroke();
     }
+
+    // Dimmed reference layer — the current arrangement's notes + drum
+    // hits, fixed at their absolute times so the user can drag the grid
+    // to line up with them (and the waveform).
+    _tempoDrawReferenceNotes(w, gridBottom, visibleStart, visibleEnd);
 
     // Measures: per-measure labels + draggable sync-point poles.
     const measures = _tempoMeasures();
@@ -4858,13 +4921,255 @@ function _tempoMapOnMouseDown(e, x, y) {
         return;
     }
 
-    // Click a sync-point pole to select it. Phase 2 starts the drag here.
-    S.tempoSel = _tempoSyncAtX(x, y);
+    // Click a sync-point pole to select it and start a drag.
+    const hit = _tempoSyncAtX(x, y);
+    S.tempoSel = hit;
+    if (hit >= 0) {
+        S.drag = {
+            type: 'tempo-sync',
+            beatIdx: hit,
+            startX: x,
+            origBeats: S.beats.map(b => ({ ...b })),
+            moved: false,
+        };
+    }
     draw();
 }
 
 // Phase 3 wires the insert / delete sync-point context menu here.
 function _tempoMapOnContextMenu(e) { /* no-op until phase 3 */ }
+
+// ── Drag: move a sync point, re-spacing the two adjacent measures ────
+
+const MIN_MEASURE = 0.05;  // s — minimum gap a dragged downbeat keeps
+
+// Move the downbeat at index `d` in `beats` to `newT`, re-spacing the
+// interior sub-beats of the two adjacent measures. Downbeats other than
+// `d` keep their exact time — edits stay local. Mutates `beats`.
+function _tempoApplyDrag(beats, d, newT) {
+    let pdb = -1, ndb = -1;
+    for (let i = d - 1; i >= 0; i--) { if (beats[i].measure > 0) { pdb = i; break; } }
+    for (let i = d + 1; i < beats.length; i++) { if (beats[i].measure > 0) { ndb = i; break; } }
+    const oldT = beats[d].time;
+    beats[d].time = newT;
+    // Previous measure — re-space its interior, or rigid-shift a pickup.
+    if (pdb >= 0) {
+        const span = d - pdb;
+        for (let k = 1; k < span; k++) {
+            beats[pdb + k].time = beats[pdb].time + (newT - beats[pdb].time) * k / span;
+        }
+    } else {
+        const dt = newT - oldT;
+        for (let i = 0; i < d; i++) beats[i].time += dt;
+    }
+    // Next measure — re-space its interior, or rigid-shift the tail.
+    if (ndb >= 0) {
+        const span = ndb - d;
+        for (let k = 1; k < span; k++) {
+            beats[d + k].time = newT + (beats[ndb].time - newT) * k / span;
+        }
+    } else {
+        const dt = newT - oldT;
+        for (let i = d + 1; i < beats.length; i++) beats[i].time += dt;
+    }
+}
+
+function _tempoMapOnDragMove(x) {
+    const dg = S.drag;
+    if (!dg || dg.type !== 'tempo-sync') return;
+    if (!dg.moved && Math.abs(x - dg.startX) < 3) return;
+    dg.moved = true;
+    const d = dg.beatIdx;
+    const orig = dg.origBeats;
+    // Bounding downbeats from the ORIGINAL grid.
+    let pdb = -1, ndb = -1;
+    for (let i = d - 1; i >= 0; i--) { if (orig[i].measure > 0) { pdb = i; break; } }
+    for (let i = d + 1; i < orig.length; i++) { if (orig[i].measure > 0) { ndb = i; break; } }
+    const loBound = pdb >= 0 ? orig[pdb].time + MIN_MEASURE : 0;
+    const hiBound = ndb >= 0
+        ? orig[ndb].time - MIN_MEASURE
+        : (S.duration || orig[orig.length - 1].time);
+    const newT = Math.max(loBound, Math.min(hiBound, xToTime(x)));
+    // Rebuild from the original grid each move so re-drags don't compound.
+    S.beats = orig.map(b => ({ ...b }));
+    _tempoApplyDrag(S.beats, d, newT);
+    draw();
+}
+
+function _tempoMapOnDragEnd() {
+    const dg = S.drag;
+    S.drag = null;
+    if (!dg || dg.type !== 'tempo-sync') return;
+    if (!dg.moved) { draw(); return; }  // a click-select, not a drag
+    const newBeats = S.beats.map(b => ({ ...b }));
+    S.beats = dg.origBeats;  // revert — TempoMapCmd.exec re-applies it
+    S.history.exec(new TempoMapCmd(dg.origBeats, newBeats, 'drag'));
+    draw();
+}
+
+// ── Notes ride the grid — piecewise-linear time remapper ────────────
+
+// Build remap(t): maps an absolute time from the old beat grid to the
+// new one by linear interpolation within the corresponding segment.
+// A segment whose endpoints didn't move maps identically, so edits to
+// one measure leave the rest of the song untouched.
+function _makeTimeRemap(oldBeats, newBeats) {
+    const ot = oldBeats.map(b => b.time);
+    const nt = newBeats.map(b => b.time);
+    const n = ot.length;
+    return function remap(t) {
+        if (n === 0) return t;
+        if (t <= ot[0]) return t + (nt[0] - ot[0]);
+        if (t >= ot[n - 1]) return t + (nt[n - 1] - ot[n - 1]);
+        let lo = 0, hi = n - 1;
+        while (lo < hi) {
+            const m = (lo + hi + 1) >> 1;
+            if (ot[m] <= t) lo = m; else hi = m - 1;
+        }
+        const span = ot[lo + 1] - ot[lo];
+        const frac = span > 1e-9 ? (t - ot[lo]) / span : 0;
+        return nt[lo] + frac * (nt[lo + 1] - nt[lo]);
+    };
+}
+
+const _r3 = v => Math.round(v * 1000) / 1000;
+
+// Apply `remap` to every timed object the scope re-times. Always
+// re-times drum_tab hits; 'all' additionally re-times every
+// arrangement's notes/chords/anchors/handshapes/phrases + sections.
+function _applyTempoRemap(remap, scope) {
+    if (S.drumTab && Array.isArray(S.drumTab.hits)) {
+        for (const h of S.drumTab.hits) {
+            if (typeof h.t === 'number') h.t = _r3(remap(h.t));
+        }
+        S.drumTabDirty = true;
+    }
+    if (scope !== 'all') return;
+    const remapNote = (o) => {
+        if (typeof o.time !== 'number') return;
+        const oldT = o.time;
+        o.time = _r3(remap(oldT));
+        if (typeof o.sustain === 'number' && o.sustain > 0) {
+            o.sustain = Math.max(0, _r3(remap(oldT + o.sustain) - remap(oldT)));
+        }
+    };
+    for (const arr of (S.arrangements || [])) {
+        if (!arr) continue;
+        for (const n of (arr.notes || [])) remapNote(n);
+        for (const ch of (arr.chords || [])) {
+            if (typeof ch.time === 'number') ch.time = _r3(remap(ch.time));
+            for (const cn of (ch.notes || [])) remapNote(cn);
+        }
+        for (const a of (arr.anchors || [])) {
+            if (typeof a.time === 'number') a.time = _r3(remap(a.time));
+        }
+        for (const hs of (arr.handshapes || [])) {
+            if (typeof hs.time === 'number') hs.time = _r3(remap(hs.time));
+            if (typeof hs.endTime === 'number') hs.endTime = _r3(remap(hs.endTime));
+            if (typeof hs.end_time === 'number') hs.end_time = _r3(remap(hs.end_time));
+        }
+        for (const ph of (arr.phrases || [])) {
+            if (typeof ph.time === 'number') ph.time = _r3(remap(ph.time));
+        }
+    }
+    for (const s of (S.sections || [])) {
+        if (typeof s.start_time === 'number') s.start_time = _r3(remap(s.start_time));
+    }
+}
+
+// Snapshot the exact times the scope re-times, so undo restores them
+// without inverse-remap rounding drift.
+function _captureScopedTimes(scope) {
+    const snap = { drum: null, arr: null, sections: null };
+    if (S.drumTab && Array.isArray(S.drumTab.hits)) {
+        snap.drum = S.drumTab.hits.map(h => h.t);
+    }
+    if (scope === 'all') {
+        snap.arr = (S.arrangements || []).map(arr => {
+            if (!arr) return null;
+            return {
+                notes: (arr.notes || []).map(n => ({ time: n.time, sustain: n.sustain })),
+                chords: (arr.chords || []).map(ch => ({
+                    time: ch.time,
+                    notes: (ch.notes || []).map(cn => ({ time: cn.time, sustain: cn.sustain })),
+                })),
+                anchors: (arr.anchors || []).map(a => a.time),
+                handshapes: (arr.handshapes || []).map(hs => ({
+                    time: hs.time, endTime: hs.endTime, end_time: hs.end_time,
+                })),
+                phrases: (arr.phrases || []).map(p => p.time),
+            };
+        });
+        snap.sections = (S.sections || []).map(s => s.start_time);
+    }
+    return snap;
+}
+
+function _restoreScopedTimes(snap, scope) {
+    if (snap.drum && S.drumTab && Array.isArray(S.drumTab.hits)) {
+        const hits = S.drumTab.hits;
+        for (let i = 0; i < hits.length && i < snap.drum.length; i++) {
+            hits[i].t = snap.drum[i];
+        }
+    }
+    if (scope === 'all' && snap.arr) {
+        for (let ai = 0; ai < (S.arrangements || []).length; ai++) {
+            const arr = S.arrangements[ai], a = snap.arr[ai];
+            if (!arr || !a) continue;
+            (arr.notes || []).forEach((n, i) => {
+                if (a.notes[i]) { n.time = a.notes[i].time; n.sustain = a.notes[i].sustain; }
+            });
+            (arr.chords || []).forEach((ch, i) => {
+                if (!a.chords[i]) return;
+                ch.time = a.chords[i].time;
+                (ch.notes || []).forEach((cn, j) => {
+                    if (a.chords[i].notes[j]) {
+                        cn.time = a.chords[i].notes[j].time;
+                        cn.sustain = a.chords[i].notes[j].sustain;
+                    }
+                });
+            });
+            (arr.anchors || []).forEach((an, i) => {
+                if (a.anchors[i] !== undefined) an.time = a.anchors[i];
+            });
+            (arr.handshapes || []).forEach((hs, i) => {
+                if (!a.handshapes[i]) return;
+                hs.time = a.handshapes[i].time;
+                hs.endTime = a.handshapes[i].endTime;
+                hs.end_time = a.handshapes[i].end_time;
+            });
+            (arr.phrases || []).forEach((ph, i) => {
+                if (a.phrases[i] !== undefined) ph.time = a.phrases[i];
+            });
+        }
+        if (snap.sections) {
+            (S.sections || []).forEach((s, i) => {
+                if (snap.sections[i] !== undefined) s.start_time = snap.sections[i];
+            });
+        }
+    }
+}
+
+// Undo command for one tempo-map edit. Captures the scope at
+// construction so undo stays consistent if the toggle is flipped later.
+class TempoMapCmd {
+    constructor(oldBeats, newBeats, label) {
+        this.oldBeats = oldBeats.map(b => ({ ...b }));
+        this.newBeats = newBeats.map(b => ({ ...b }));
+        this.scope = S.tempoRideScope;
+        this.label = label || 'tempo';
+        this.before = null;
+    }
+    exec() {
+        if (!this.before) this.before = _captureScopedTimes(this.scope);
+        S.beats = this.newBeats.map(b => ({ ...b }));
+        _applyTempoRemap(_makeTimeRemap(this.oldBeats, this.newBeats), this.scope);
+    }
+    rollback() {
+        S.beats = this.oldBeats.map(b => ({ ...b }));
+        _restoreScopedTimes(this.before, this.scope);
+    }
+}
 
 // Add a hit at the snap-aligned time on the lane under (x, y). Returns
 // true if added (false if click was outside the lane grid).
