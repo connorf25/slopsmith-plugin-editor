@@ -4868,6 +4868,19 @@ function _refreshTempoMapButton() {
         btn.classList.remove('bg-amber-600', 'hover:bg-amber-500');
         btn.classList.add('bg-dark-600', 'hover:bg-dark-500');
     }
+    // The toolbar BPM input / Sync button show a single song-wide tempo;
+    // in tempo-map mode the song can have many per-measure BPMs, so the
+    // input would be misleading — disable it while the mode is active.
+    for (const id of ['editor-bpm', 'editor-sync-btn']) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.disabled = !!S.tempoMapMode;
+            el.style.opacity = S.tempoMapMode ? '0.4' : '';
+            el.title = S.tempoMapMode
+                ? 'Disabled in Tempo Map mode — edit per-measure tempo on the grid'
+                : '';
+        }
+    }
 }
 
 // ── Scope toggle — a DOM control overlaid on the canvas, shown only
