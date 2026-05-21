@@ -40,18 +40,13 @@ def _mix_stems_for_editor(stem_paths: list, dest) -> bool:
     playback. A stem-split sloppak has no `full` mix on disk, so without
     this the editor would play only the first stem (a lone instrument).
 
-    Cached: skips the re-encode when `dest` is already newer than every
-    input stem. Returns True when `dest` holds a usable mixed file.
+    Re-encodes on every call (no mtime cache): the `full` / single-stem
+    branches re-copy each load too, and an mtime cache could serve a
+    stale mix if a sloppak is replaced in place with stems carrying
+    older timestamps. Returns True when `dest` holds a usable mix.
     """
     if len(stem_paths) < 2:
         return False
-    try:
-        if dest.exists():
-            dmt = dest.stat().st_mtime
-            if all(dmt >= p.stat().st_mtime for p in stem_paths):
-                return True
-    except OSError:
-        pass
 
     ffmpeg = None
     try:
