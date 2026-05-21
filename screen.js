@@ -1606,6 +1606,14 @@ function onKeyDown(e) {
         return;
     }
 
+    // Tempo-map mode: Insert key adds a sync point at the cursor.
+    if (S.tempoMapMode && e.key === 'Insert'
+            && !e.target.matches('input, select, textarea')) {
+        e.preventDefault();
+        _tempoInsertSyncPoint(S.cursorTime);
+        return;
+    }
+
     // Block all note-mutating shortcuts while a take is active so mid-take
     // edits can't be silently overwritten when arr.notes = _recNotes on Stop.
     // Spacebar (above) is still allowed because it routes to editorTogglePlay
@@ -1613,6 +1621,13 @@ function onKeyDown(e) {
     if (_recState === 'recording') return;
 
     if (e.key === 'Delete' || e.key === 'Backspace') {
+        // Tempo-map mode: delete the selected sync point.
+        if (S.tempoMapMode && S.tempoSel >= 0 &&
+                !e.target.matches('input, select, textarea')) {
+            e.preventDefault();
+            _tempoDeleteSyncPoint(S.tempoSel);
+            return;
+        }
         // Drum-edit mode: delete selected drum hits in place. No undo
         // (would need a sibling DrumEditCmd class — out of scope for this PR).
         // Guard against focus being inside a form control (mirrors the note-
@@ -4937,7 +4952,116 @@ function _tempoMapOnMouseDown(e, x, y) {
 }
 
 // Phase 3 wires the insert / delete sync-point context menu here.
-function _tempoMapOnContextMenu(e) { /* no-op until phase 3 */ }
+function _tempoMapOnContextMenu(e) {
+    const { x, y } = getMousePos(e);
+    const menu = document.getElementById('editor-context-menu');
+    if (!menu) return;
+    const onPole = _tempoSyncAtX(x, y);
+    const mkBtn = (action, label, cls) =>
+        `<button class="w-full text-left px-3 py-1 text-xs hover:bg-dark-500 ${cls || ''}" `
+        + `data-action="${action}">${label}</button>`;
+    let html = '';
+    if (onPole >= 0) {
+        html += mkBtn('delete', 'Delete sync point', 'text-red-400');
+    } else {
+        html += mkBtn('insert', 'Insert sync point here');
+    }
+    menu.innerHTML = html;
+    menu.querySelectorAll('[data-action]').forEach(btn => {
+        btn.onclick = () => {
+            hideContextMenu();
+            if (btn.dataset.action === 'delete') _tempoDeleteSyncPoint(onPole);
+            else if (btn.dataset.action === 'insert') _tempoInsertSyncPoint(xToTime(x));
+        };
+    });
+    menu.style.left = e.clientX + 'px';
+    menu.style.top = e.clientY + 'px';
+    menu.classList.remove('hidden');
+}
+
+// ── Insert / delete sync points ─────────────────────────────────────
+//
+// Both are pure `measure`-field edits on S.beats: insert promotes the
+// nearest interior sub-beat to a downbeat (splitting a measure), delete
+// demotes a downbeat back to a sub-beat (merging two measures). No beat
+// time moves, so no note re-timing is needed — TempoGridCmd just swaps
+// the beats array.
+
+// Renumber every downbeat sequentially, preserving the first one's number.
+function _tempoRenumberMeasures(beats) {
+    let m = null;
+    for (const b of beats) {
+        if (b.measure > 0) {
+            m = (m === null) ? b.measure : m + 1;
+            b.measure = m;
+        }
+    }
+}
+
+function _tempoInsertSyncPoint(time) {
+    const beats = S.beats || [];
+    if (beats.length < 2) return;
+    const dbIdx = [];
+    for (let i = 0; i < beats.length; i++) if (beats[i].measure > 0) dbIdx.push(i);
+    if (!dbIdx.length) return;
+    // Locate the measure [d, ndb) containing `time`.
+    let d = dbIdx[0], ndb = beats.length;
+    for (let k = 0; k < dbIdx.length; k++) {
+        const i = dbIdx[k];
+        const nextI = (k + 1 < dbIdx.length) ? dbIdx[k + 1] : beats.length;
+        const endT = (nextI < beats.length) ? beats[nextI].time : Infinity;
+        if (time >= beats[i].time && time < endT) { d = i; ndb = nextI; break; }
+    }
+    // Promote the interior sub-beat nearest to `time`.
+    let bestS = -1, bestDist = Infinity;
+    for (let i = d + 1; i < ndb; i++) {
+        if (beats[i].measure > 0) continue;
+        const dist = Math.abs(beats[i].time - time);
+        if (dist < bestDist) { bestDist = dist; bestS = i; }
+    }
+    if (bestS < 0) {
+        setStatus('Measure has no beat to split on — nothing to insert.');
+        return;
+    }
+    const oldBeats = beats.map(b => ({ ...b }));
+    const newBeats = beats.map(b => ({ ...b }));
+    newBeats[bestS].measure = 1;  // placeholder; renumbered next
+    _tempoRenumberMeasures(newBeats);
+    S.history.exec(new TempoGridCmd(oldBeats, newBeats, 'insert'));
+    S.tempoSel = bestS;
+    draw();
+}
+
+function _tempoDeleteSyncPoint(beatIdx) {
+    const beats = S.beats || [];
+    if (beatIdx < 0 || beatIdx >= beats.length || beats[beatIdx].measure <= 0) return;
+    const dbIdx = [];
+    for (let i = 0; i < beats.length; i++) if (beats[i].measure > 0) dbIdx.push(i);
+    if (dbIdx[0] === beatIdx || dbIdx[dbIdx.length - 1] === beatIdx) {
+        setStatus("Can't delete the first or last sync point.");
+        return;
+    }
+    const oldBeats = beats.map(b => ({ ...b }));
+    const newBeats = beats.map(b => ({ ...b }));
+    newBeats[beatIdx].measure = -1;  // demote to sub-beat
+    _tempoRenumberMeasures(newBeats);
+    S.history.exec(new TempoGridCmd(oldBeats, newBeats, 'delete'));
+    S.tempoSel = -1;
+    draw();
+}
+
+// Undo command for insert/delete/time-signature edits — these only
+// change `measure` fields / sub-beat layout, never beat times, so no
+// note re-timing is involved; it just swaps the beats array.
+class TempoGridCmd {
+    constructor(oldBeats, newBeats, label) {
+        this.oldBeats = oldBeats.map(b => ({ ...b }));
+        this.newBeats = newBeats.map(b => ({ ...b }));
+        this.label = label || 'grid';
+    }
+    exec() { S.beats = this.newBeats.map(b => ({ ...b })); }
+    rollback() { S.beats = this.oldBeats.map(b => ({ ...b })); }
+}
 
 // ── Drag: move a sync point, re-spacing the two adjacent measures ────
 
