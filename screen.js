@@ -4955,6 +4955,10 @@ function _tempoMapOnMouseDown(e, x, y) {
 
     // Waveform-area click sets the playback cursor.
     if (y < WAVEFORM_H) {
+        // Block the seek while a MIDI take is recording — restarting the
+        // source node would prematurely finalize the take (mirrors the
+        // guard on the normal-mode waveform click).
+        if (_recState === 'recording') return;
         S.cursorTime = Math.max(0, xToTime(x));
         if (S.playing) { stopPlayback(); startPlayback(); }
         draw();
@@ -5248,7 +5252,14 @@ function _applyTempoRemap(remap, scope) {
             o.sustain = Math.max(0, _r3(remap(oldT + o.sustain) - remap(oldT)));
         }
     };
-    for (const arr of (S.arrangements || [])) {
+    // PSARC saves only persist the active arrangement (_buildSaveBody
+    // ships body.arrangements for sloppak only). Re-timing a non-active
+    // arrangement on a PSARC would be silently lost on reload — so on
+    // PSARC, 'all' scope is limited to the arrangement being edited.
+    const retimeArrs = (S.format === 'psarc' && S.arrangements[S.currentArr])
+        ? [S.arrangements[S.currentArr]]
+        : (S.arrangements || []);
+    for (const arr of retimeArrs) {
         if (!arr) continue;
         for (const n of (arr.notes || [])) remapNote(n);
         for (const ch of (arr.chords || [])) {
