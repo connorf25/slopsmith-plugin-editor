@@ -1157,6 +1157,49 @@ class RemoveStringCmd {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// AutoAlignCmd — undo/redo for the Auto-Align time warp.
+// Snapshots beat times, every arrangement's note times+sustains, and
+// section times before mutating. Restore exact snapshot on undo.
+// ════════════════════════════════════════════════════════════════════
+class AutoAlignCmd {
+    constructor(newBeats, newNotesByArr, newSections) {
+        // Snapshot pre-state.
+        this.oldBeats = S.beats.map(b => ({ ...b }));
+        this.oldSections = S.sections.map(s => ({ ...s }));
+        this.oldNotesByArr = S.arrangements.map(arr => arr.notes.map(n => ({ ...n })));
+
+        this.newBeats = newBeats;
+        this.newNotesByArr = newNotesByArr;
+        this.newSections = newSections;
+    }
+
+    exec() {
+        // Mutate beats in place (preserve identity for any references).
+        S.beats.length = 0;
+        for (const b of this.newBeats) S.beats.push(b);
+        S.sections.length = 0;
+        for (const s of this.newSections) S.sections.push(s);
+        for (let ai = 0; ai < S.arrangements.length; ai++) {
+            const arr = S.arrangements[ai];
+            arr.notes.length = 0;
+            for (const n of this.newNotesByArr[ai] || []) arr.notes.push(n);
+        }
+    }
+
+    undo() {
+        S.beats.length = 0;
+        for (const b of this.oldBeats) S.beats.push(b);
+        S.sections.length = 0;
+        for (const s of this.oldSections) S.sections.push(s);
+        for (let ai = 0; ai < S.arrangements.length; ai++) {
+            const arr = S.arrangements[ai];
+            arr.notes.length = 0;
+            for (const n of this.oldNotesByArr[ai] || []) arr.notes.push(n);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Mouse interactions
 // ════════════════════════════════════════════════════════════════════
 
