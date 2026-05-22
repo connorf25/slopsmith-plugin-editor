@@ -3007,6 +3007,9 @@ def setup(app, context):
 
     @app.post("/api/plugins/editor/detect-beats")
     async def detect_beats(data: dict):
+        import io as _io
+        from fastapi import UploadFile
+
         provider = _find_provider_endpoint("/api/plugins/auto-align/detect-beats")
         if provider is None:
             return JSONResponse(
@@ -3019,7 +3022,45 @@ def setup(app, context):
                 },
                 status_code=503,
             )
-        # Subsequent tasks will extend this with audio resolution, cache, and proxy.
-        return JSONResponse(
-            {"error": "not_implemented"}, status_code=501
+
+        session_str = data.get("session", "")
+        force = bool(data.get("force", False))
+
+        session_path = Path(session_str)
+        if not session_path.is_dir():
+            return JSONResponse(
+                {"error": "audio_missing", "detail": f"session dir not found: {session_str}"},
+                status_code=404,
+            )
+
+        # Find the audio file: any of audio.wav/mp3/ogg/m4a/flac in the session dir.
+        audio_path = None
+        for ext in ("wav", "mp3", "ogg", "m4a", "flac"):
+            candidate = session_path / f"audio.{ext}"
+            if candidate.exists():
+                audio_path = candidate
+                break
+        if audio_path is None:
+            return JSONResponse(
+                {"error": "audio_missing", "detail": "no audio file in session"},
+                status_code=404,
+            )
+
+        # Call provider in-process. Build an UploadFile from the audio bytes.
+        audio_bytes = audio_path.read_bytes()
+        upload = UploadFile(
+            filename=audio_path.name,
+            file=_io.BytesIO(audio_bytes),
         )
+        try:
+            result = await provider(audio=upload)
+        except Exception as e:
+            return JSONResponse(
+                {"error": "detection_failed", "detail": str(e)},
+                status_code=502,
+            )
+
+        # Provider can return either a dict or a JSONResponse.
+        if hasattr(result, "body"):
+            return result
+        return result
