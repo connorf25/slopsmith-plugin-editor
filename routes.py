@@ -2989,3 +2989,37 @@ def setup(app, context):
                 print(f"[Editor] xml2sng failed: {result.stderr}")
         except Exception as e:
             print(f"[Editor] xml2sng error: {e}")
+
+    # ------------------------------------------------------------------
+    # Auto-Align: forwarding route. Proxies multipart audio to the
+    # optional slopsmith-plugin-auto-align provider (if installed),
+    # caches the result per session. See
+    # specs/002-auto-align-editor-side/spec.md.
+    # ------------------------------------------------------------------
+
+    def _find_provider_endpoint(target_path: str):
+        """Look up the provider plugin's route handler on the same app
+        by path. Returns the bound endpoint function or None if not mounted."""
+        for route in app.routes:
+            if getattr(route, "path", None) == target_path:
+                return route.endpoint
+        return None
+
+    @app.post("/api/plugins/editor/detect-beats")
+    async def detect_beats(data: dict):
+        provider = _find_provider_endpoint("/api/plugins/auto-align/detect-beats")
+        if provider is None:
+            return JSONResponse(
+                {
+                    "error": "sidecar_unavailable",
+                    "install_hint": (
+                        "Install the slopsmith-plugin-auto-align provider to "
+                        "enable Auto-Align."
+                    ),
+                },
+                status_code=503,
+            )
+        # Subsequent tasks will extend this with audio resolution, cache, and proxy.
+        return JSONResponse(
+            {"error": "not_implemented"}, status_code=501
+        )
