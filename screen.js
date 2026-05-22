@@ -4980,6 +4980,14 @@ async function fetchDetection({ force }) {
         alignState.detection = await resp.json();
         alignState.firstBeatK = findFirstDownbeat(alignState.detection.beats, S.offset || 0);
         alignState.pollAttempts = 0;
+        const _gpSec = alignState.detection.gp_sections;
+        if (_gpSec && _gpSec.length >= 2) {
+            console.log('[AutoAlign] Detection returned', _gpSec.length, 'GP tempo zone(s) → multi-section pass will be used:', _gpSec);
+        } else if (_gpSec && _gpSec.length === 1) {
+            console.log('[AutoAlign] Detection returned 1 GP tempo zone (need ≥2 for multi-section pass) → single-section path will be used:', _gpSec);
+        } else {
+            console.log('[AutoAlign] Detection returned no gp_sections → single-section path will be used. Session gp_path present?', !!S.sessionId, '— session format:', S.format || '(unknown)');
+        }
         renderAlignBody();
     } catch (e) {
         clearInterval(ticker);
@@ -5010,8 +5018,14 @@ function renderAlignBody() {
     const d = alignState.detection;
     const M = d.beats.length;
     const D = d.beats.filter(b => b.downbeat).length;
+    const gpZones = (d.gp_sections || []).length;
+    const gpZonesStr = gpZones >= 2
+        ? ` · ${gpZones} GP tempo zones (multi-section)`
+        : gpZones === 1
+            ? ` · 1 GP tempo zone (need ≥2 for multi-section)`
+            : '';
     document.getElementById('editor-align-stats-detected').textContent =
-        `${M} beats detected · ${D} downbeats · ${d.mean_bpm.toFixed(1)} BPM avg`;
+        `${M} beats detected · ${D} downbeats · ${d.mean_bpm.toFixed(1)} BPM avg${gpZonesStr}`;
     const N = S.beats.length;
     const measures = S.beats.filter(b => b.measure > 0).length;
     document.getElementById('editor-align-stats-tab').textContent =
@@ -5071,36 +5085,226 @@ window.editorAlignAutoPickDownbeat = () => {
     drawAlignPreview();
 };
 
-window.editorAlignApply = () => {
+window.editorAlignApply = async () => {
     if (!alignState.detection) return;
 
-    // Compute warped beats and sections (shared across arrangements).
-    const beatWarp = warpTabToAudioBeats({
-        tabBeats: S.beats,
-        notes: [],
-        sections: S.sections,
-        detectedBeats: alignState.detection.beats,
-        k: alignState.firstBeatK,
-        mode: alignState.mismatchMode,
-    });
+    const gpSections = alignState.detection.gp_sections;
+    if (!gpSections || gpSections.length < 2) {
+        console.log('[AutoAlign] Apply: single-section path.',
+            gpSections ? `gp_sections has ${gpSections.length} entry (need ≥2).` : 'gp_sections absent — not a GP import or all tempos within 5% of each other.');
+    } else {
+        console.log('[AutoAlign] Apply: multi-section path.', gpSections.length, 'GP tempo zones:', gpSections);
+    }
 
-    // Per-arrangement, warp that arrangement's notes against the same beat grid.
-    const newNotesByArr = S.arrangements.map(arr => {
-        const w = warpTabToAudioBeats({
+    // ── Single-section (no GP tempo changes): original flow ──────────────
+    if (!gpSections || gpSections.length < 2) {
+        const beatWarp = warpTabToAudioBeats({
             tabBeats: S.beats,
-            notes: arr.notes,
-            sections: [],
+            notes: [],
+            sections: S.sections,
             detectedBeats: alignState.detection.beats,
             k: alignState.firstBeatK,
             mode: alignState.mismatchMode,
         });
-        return w.notes;
+        const newNotesByArr = S.arrangements.map(arr => {
+            const w = warpTabToAudioBeats({
+                tabBeats: S.beats,
+                notes: arr.notes,
+                sections: [],
+                detectedBeats: alignState.detection.beats,
+                k: alignState.firstBeatK,
+                mode: alignState.mismatchMode,
+            });
+            return w.notes;
+        });
+        S.history.exec(new AutoAlignCmd(beatWarp.beats, newNotesByArr, beatWarp.sections));
+        document.getElementById('editor-align-dialog').classList.add('hidden');
+        draw();
+        setStatus(`Auto-aligned to ${beatWarp.beats.length} audio beats`);
+        return;
+    }
+
+    // ── Multi-section: align section 0 with user's firstBeatK, then
+    //    auto-detect and auto-align each subsequent tempo section. ─────────
+    //
+    // Why we iterate rather than pre-segment: the tempo change boundaries
+    // in the GP file are GP-time values, not audio-time values.  Only after
+    // aligning section 0 do we know the correct audio time for the next
+    // boundary.  Each subsequent section is therefore detected only after
+    // the previous warp is complete.
+    //
+    // All sections are committed in a single AutoAlignCmd so the entire
+    // multi-section alignment is one undo step.
+
+    // Snapshot original GP beat/note times — S.beats/notes must not be
+    // mutated until the final exec at the very end.
+    const originalBeats    = S.beats.map(b => ({ ...b }));
+    const originalSections = S.sections.map(s => ({ ...s }));
+    const originalNotesByArr = S.arrangements.map(arr => arr.notes.map(n => ({ ...n })));
+
+    // Find the beat index in originalBeats closest to each GP section time.
+    const sectionBeatIndices = gpSections.map(sec => {
+        let best = 0, bestDiff = Infinity;
+        for (let i = 0; i < originalBeats.length; i++) {
+            const diff = Math.abs(originalBeats[i].time - sec.gp_time);
+            if (diff < bestDiff) { bestDiff = diff; best = i; }
+        }
+        return best;
+    });
+    const numSections = gpSections.length;
+
+    document.getElementById('editor-align-dialog').classList.add('hidden');
+    setStatus(`Auto-aligning section 1 of ${numSections}…`);
+
+    // ── Section 0: warp beats/notes/sections before the first boundary. ───
+    const B1        = sectionBeatIndices[1];
+    const sec0GpEnd = originalBeats[B1] ? originalBeats[B1].time : Infinity;
+
+    const beatWarp0 = warpTabToAudioBeats({
+        tabBeats: originalBeats.slice(0, B1),
+        notes: [],
+        sections: originalSections.filter(s => s.start_time < sec0GpEnd),
+        detectedBeats: alignState.detection.beats,
+        k: alignState.firstBeatK,
+        mode: 'truncate',
     });
 
-    S.history.exec(new AutoAlignCmd(beatWarp.beats, newNotesByArr, beatWarp.sections));
-    document.getElementById('editor-align-dialog').classList.add('hidden');
+    let allNewBeats    = [...beatWarp0.beats];
+    let allNewSections = [...beatWarp0.sections];
+    const allNewNotesByArr = originalNotesByArr.map((notes, ai) => {
+        const w = warpTabToAudioBeats({
+            tabBeats: originalBeats.slice(0, B1),
+            notes: notes.filter(n => n.time < sec0GpEnd),
+            sections: [],
+            detectedBeats: alignState.detection.beats,
+            k: alignState.firstBeatK,
+            mode: 'truncate',
+        });
+        return [...w.notes];
+    });
+
+    // Track the last section index that was successfully aligned.
+    let lastAlignedSi = 0;
+
+    // ── Sections 1, 2, … : re-detect from the aligned audio boundary, ────
+    //    then auto-warp (k=0, no user downbeat selection needed).
+    for (let si = 1; si < numSections; si++) {
+        const Bi  = sectionBeatIndices[si];
+        const Bi1 = si + 1 < numSections ? sectionBeatIndices[si + 1] : originalBeats.length;
+
+        // Derive the section's audio start from the last warped beat.
+        // One additional beat-interval puts us at the first beat of the new
+        // section rather than the last beat of the previous one.
+        const lastBeat = allNewBeats[allNewBeats.length - 1];
+        const prevBeat = allNewBeats.length >= 2 ? allNewBeats[allNewBeats.length - 2] : null;
+        const interval = prevBeat ? lastBeat.time - prevBeat.time : 0.5;
+        const sectionAudioStart = lastBeat.time + interval;
+
+        setStatus(`Auto-aligning section ${si + 1} of ${numSections}…`);
+
+        let detection_si;
+        try {
+            const resp = await fetch('/api/plugins/editor/detect-beats', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: S.sessionId,
+                    force: true,
+                    audio_url: S.audioUrl || '',
+                    audio_start_time: sectionAudioStart,
+                }),
+            });
+            if (!resp.ok) break;
+            detection_si = await resp.json();
+            if (detection_si.error) break;
+        } catch (_e) {
+            break;
+        }
+
+        const tabBeats_si = originalBeats.slice(Bi, Bi1);
+        const secGpStart  = originalBeats[Bi]  ? originalBeats[Bi].time  : 0;
+        const secGpEnd    = originalBeats[Bi1] ? originalBeats[Bi1].time : Infinity;
+
+        // Build the beat list for this section:
+        //  1. Prepend a synthetic beat at sectionAudioStart (derived from the
+        //     aligned section-0 grid). With only 100ms of look-back the detector
+        //     rarely finds the very first beat of the new section, so we anchor
+        //     tabBeats_si[0] here explicitly.
+        //  2. Discard any detected beat within the 100ms padding window to avoid
+        //     a duplicate close to the synthetic anchor.
+        //  3. Keep everything at or after sectionAudioStart + 100ms.
+        const RANGE_PAD = 0.1; // must match context_secs in _detect_beats_range
+        const sectionBeats = [
+            { time: sectionAudioStart, downbeat: true },
+            ...detection_si.beats.filter(b => b.time > sectionAudioStart + RANGE_PAD),
+        ];
+        console.log(
+            `[AutoAlign] section ${si + 1}: raw beats=${detection_si.beats.length}` +
+            ` after anchor+dedup: ${sectionBeats.length}` +
+            ` first=${sectionAudioStart.toFixed(3)}s (synthetic)` +
+            (sectionBeats.length > 1 ? ` second=${sectionBeats[1].time.toFixed(3)}s` : ''),
+        );
+        if (sectionBeats.length < 2) {
+            console.warn(`[AutoAlign] section ${si + 1}: too few beats (${sectionBeats.length}), stopping multi-section pass`);
+            break;
+        }
+
+        const beatWarp_si = warpTabToAudioBeats({
+            tabBeats: tabBeats_si,
+            notes: [],
+            sections: originalSections.filter(s => s.start_time >= secGpStart && s.start_time < secGpEnd),
+            detectedBeats: sectionBeats,
+            k: 0,
+            mode: 'truncate',
+        });
+
+        allNewBeats    = [...allNewBeats, ...beatWarp_si.beats];
+        allNewSections = [...allNewSections, ...beatWarp_si.sections];
+
+        // Warp notes using the same beat grid as the beats. sectionBeats[0] is
+        // the synthetic anchor at sectionAudioStart (beat 1 of this section),
+        // so tabBeats_si[0] → sectionAudioStart and all notes start correctly.
+        // truncate mode handles partial coverage: notes past the last mapped
+        // beat get a rigid shift from that beat's offset rather than falling
+        // back to GP time (which would be early relative to the audio grid).
+        originalNotesByArr.forEach((notes, ai) => {
+            const w = warpTabToAudioBeats({
+                tabBeats: tabBeats_si,
+                notes: notes.filter(n => n.time >= secGpStart && n.time < secGpEnd),
+                sections: [],
+                detectedBeats: sectionBeats,
+                k: 0,
+                mode: 'truncate',
+            });
+            allNewNotesByArr[ai] = [...allNewNotesByArr[ai], ...w.notes];
+        });
+
+        lastAlignedSi = si;
+    }
+
+    // If any sections failed, preserve their beats/notes/sections in GP time.
+    if (lastAlignedSi < numSections - 1) {
+        const firstUnalignedBeat = sectionBeatIndices[lastAlignedSi + 1];
+        allNewBeats    = [...allNewBeats, ...originalBeats.slice(firstUnalignedBeat)];
+        const unalignedGpStart = originalBeats[firstUnalignedBeat]?.time ?? 0;
+        allNewSections = [...allNewSections,
+            ...originalSections.filter(s => s.start_time >= unalignedGpStart)];
+        originalNotesByArr.forEach((notes, ai) => {
+            allNewNotesByArr[ai] = [...allNewNotesByArr[ai],
+                ...notes.filter(n => n.time >= unalignedGpStart)];
+        });
+    }
+
+    allNewBeats.sort((a, b) => a.time - b.time);
+    allNewSections.sort((a, b) => a.start_time - b.start_time);
+    allNewNotesByArr.forEach(notes => notes.sort((a, b) => a.time - b.time));
+
+    const alignedCount = lastAlignedSi + 1;
+    S.history.exec(new AutoAlignCmd(allNewBeats, allNewNotesByArr, allNewSections));
     draw();
-    setStatus(`Auto-aligned to ${beatWarp.beats.length} audio beats`);
+    setStatus(alignedCount < numSections
+        ? `Auto-aligned ${alignedCount} of ${numSections} sections (${allNewBeats.length} beats) — later sections preserved in tab time`
+        : `Auto-aligned ${numSections} tempo sections (${allNewBeats.length} beats)`);
 };
 
 function drawAlignPreview() {

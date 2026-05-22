@@ -3016,6 +3016,154 @@ def setup(app, context):
                 return route.endpoint
         return None
 
+    def _get_gp_tempo_sections(gp_path_str, change_threshold=0.05):
+        """Extract significant-BPM-change boundaries from a GP file.
+
+        Returns a list of (gp_time_secs, bpm) for each distinct tempo section
+        (changes >= change_threshold as a fraction), or None when unavailable
+        / unparseable / only one tempo.
+        """
+        try:
+            import guitarpro as _guitarpro
+            from lib.gp2rs import _build_tempo_map, _tick_to_seconds
+            gp_song = _guitarpro.parse(gp_path_str)
+            tempo_map = _build_tempo_map(gp_song)
+            if len(tempo_map) < 2:
+                return None
+            sections = []
+            for evt in tempo_map:
+                t_secs = _tick_to_seconds(evt.tick, tempo_map)
+                sections.append((t_secs, evt.tempo))
+            significant = [sections[0]]
+            for s in sections[1:]:
+                prev_bpm = significant[-1][1]
+                if abs(s[1] - prev_bpm) / max(prev_bpm, 1.0) >= change_threshold:
+                    significant.append(s)
+            return significant if len(significant) >= 2 else None
+        except Exception:
+            return None
+
+    async def _detect_beats_range(audio_path, provider, start_time, context_secs=0.1):
+        """Run beat detection on audio starting from `start_time`.
+
+        Trims with a `context_secs` look-back so beat_this can lock in
+        before the target boundary, then offsets all beat times to
+        absolute audio time and filters to only return beats at or after
+        `start_time`.
+
+        Returns (result_dict, None) on success, or (None, reason_str) on
+        any failure.  The caller is responsible for caching and for passing
+        the correct audio time (derived from a previously-aligned section's
+        beat grid, not from the raw GP tempo map).
+        """
+        import shutil as _shutil
+        import io as _io
+        from fastapi import UploadFile as _UploadFile
+        import logging as _logging
+        _log = _logging.getLogger("slopsmith.plugin.editor")
+
+        ffmpeg = _shutil.which("ffmpeg") or _shutil.which("ffmpeg.exe")
+        if not ffmpeg:
+            _log.warning("[detect-beats-range] ffmpeg not found on PATH")
+            return None, "ffmpeg_not_found"
+
+        slice_start = max(0.0, start_time - context_secs)
+        _log.debug(
+            "[detect-beats-range] start_time=%.3f context_secs=%.1f → slice_start=%.3f audio=%s",
+            start_time, context_secs, slice_start, audio_path,
+        )
+
+        # Write to a temp file instead of piping to stdout. When ffmpeg pipes
+        # WAV it can't seek back to fix the data-chunk size field, so it writes
+        # 0xFFFFFFFF — which decodes as ~97391 s at 22050 Hz mono and causes
+        # providers that read the header duration to reject the upload.
+        import os as _os
+        _tmp_fd, _tmp_wav = tempfile.mkstemp(suffix=".wav", prefix="slopsmith_range_")
+        _os.close(_tmp_fd)
+        try:
+            cmd = [
+                ffmpeg, "-y", "-i", str(audio_path),
+                "-ss", f"{slice_start:.6f}",
+                "-ar", "22050", "-ac", "1", "-f", "wav", _tmp_wav,
+            ]
+            try:
+                loop = asyncio.get_running_loop()
+                proc = await loop.run_in_executor(
+                    None,
+                    lambda c=cmd: subprocess.run(c, capture_output=True, timeout=120),
+                )
+            except Exception as _e:
+                _log.warning("[detect-beats-range] ffmpeg subprocess exception: %s", _e)
+                return None, f"ffmpeg_exception: {_e}"
+            if proc.returncode != 0:
+                stderr_snip = (proc.stderr or b"")[:400].decode("utf-8", errors="replace")
+                _log.warning(
+                    "[detect-beats-range] ffmpeg failed: returncode=%d stderr=%r",
+                    proc.returncode, stderr_snip,
+                )
+                return None, f"ffmpeg_failed: rc={proc.returncode} stderr={stderr_snip!r}"
+
+            try:
+                wav_data = Path(_tmp_wav).read_bytes()
+            except OSError as _e:
+                _log.warning("[detect-beats-range] could not read temp WAV: %s", _e)
+                return None, f"tmp_read_error: {_e}"
+        finally:
+            try:
+                _os.unlink(_tmp_wav)
+            except OSError:
+                pass
+
+        if not wav_data:
+            _log.warning("[detect-beats-range] ffmpeg produced empty WAV")
+            return None, "ffmpeg_empty_output"
+
+        _log.debug("[detect-beats-range] ffmpeg produced %d bytes of WAV; calling provider", len(wav_data))
+        upload = _UploadFile(filename="section.wav", file=_io.BytesIO(wav_data))
+        try:
+            result = await provider(audio=upload)
+        except Exception as _e:
+            _log.warning("[detect-beats-range] provider call raised: %s", _e)
+            return None, f"provider_exception: {_e}"
+        if hasattr(result, "body"):
+            try:
+                _body = json.loads(result.body.decode("utf-8"))
+            except Exception:
+                _body = repr(result.body[:200])
+            _log.warning(
+                "[detect-beats-range] provider returned HTTP error: status=%s body=%s",
+                getattr(result, "status_code", "?"), _body,
+            )
+            return None, f"provider_error: status={getattr(result, 'status_code', '?')} body={_body}"
+
+        beats = []
+        for beat in result.get("beats", []):
+            abs_time = beat["time"] + slice_start
+            if abs_time >= start_time - 0.01:
+                beats.append({**beat, "time": round(abs_time, 4)})
+
+        bpm_curve = []
+        for entry in result.get("bpm_curve", []):
+            abs_t = entry[0] + slice_start
+            if abs_t >= start_time - 0.01:
+                bpm_curve.append([round(abs_t, 4), entry[1]])
+
+        mean_bpm = (
+            sum(x[1] for x in bpm_curve) / len(bpm_curve) if bpm_curve else 0.0
+        )
+        _log.debug(
+            "[detect-beats-range] success: %d beats returned (start_time=%.3f)",
+            len(beats), start_time,
+        )
+        return {
+            "beats": beats,
+            "mean_bpm": round(mean_bpm, 2),
+            "bpm_curve": bpm_curve,
+            "audio_duration": slice_start + result.get("audio_duration", 0.0),
+            "detector": result.get("detector", "beat_this"),
+            "detector_version": result.get("detector_version"),
+        }, None
+
     @app.post("/api/plugins/editor/detect-beats")
     async def detect_beats(data: dict):
         import io as _io
@@ -3096,7 +3244,41 @@ def setup(app, context):
                 status_code=404,
             )
 
-        # ----- Cache check -----
+        # `audio_start_time` > 0 means the frontend is asking for a
+        # section-specific re-detection after aligning a previous section.
+        # The correct audio boundary comes from the warped beat grid, NOT
+        # from the raw GP tempo map — so the frontend drives this, not us.
+        try:
+            audio_start_time = float(data.get("audio_start_time", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            audio_start_time = 0.0
+
+        # ----- Range-based detection (subsequent sections) -----
+        if audio_start_time > 0.0:
+            # Use a per-range cache file so it doesn't clobber the full-song result.
+            range_cache = session_path / f"beats_detected_from_{audio_start_time:.3f}.json"
+            if not force and range_cache.exists():
+                cache_mtime = range_cache.stat().st_mtime
+                audio_mtime = audio_path.stat().st_mtime
+                if cache_mtime >= audio_mtime:
+                    try:
+                        return json.loads(range_cache.read_text())
+                    except (OSError, json.JSONDecodeError):
+                        pass
+
+            result, fail_reason = await _detect_beats_range(audio_path, provider, audio_start_time)
+            if result is None:
+                return JSONResponse(
+                    {"error": "detection_failed", "detail": f"range detection failed: {fail_reason}"},
+                    status_code=502,
+                )
+            try:
+                range_cache.write_text(json.dumps(result))
+            except OSError:
+                pass
+            return result
+
+        # ----- Full-song detection (section 0 / whole-song) -----
         cache_file = session_path / "beats_detected.json"
         if not force and cache_file.exists():
             cache_mtime = cache_file.stat().st_mtime
@@ -3107,7 +3289,6 @@ def setup(app, context):
                 except (OSError, json.JSONDecodeError):
                     pass  # treat corrupt cache as miss
 
-        # Call provider in-process. Build an UploadFile from the audio bytes.
         audio_bytes = audio_path.read_bytes()
         upload = UploadFile(
             filename=audio_path.name,
@@ -3121,9 +3302,6 @@ def setup(app, context):
                 status_code=502,
             )
 
-        # If provider returned a JSONResponse (typically an error), relay its
-        # status by wrapping in our own JSONResponse with status 502 and the
-        # provider's body content as `detail`.
         if hasattr(result, "body"):
             try:
                 provider_body = json.loads(result.body.decode("utf-8"))
@@ -3138,7 +3316,20 @@ def setup(app, context):
                 status_code=502,
             )
 
-        # ----- Cache write -----
+        # When the session was created from a GP import, attach the GP
+        # tempo section boundaries so the frontend can run per-section
+        # re-detection after each section is aligned.  The frontend uses
+        # the warped beat grid (not these GP times directly) to derive the
+        # correct audio-time boundary for each subsequent detect call.
+        gp_path_val = (session.get("gp_path") or "").strip()
+        if gp_path_val and Path(gp_path_val).exists():
+            _sections = _get_gp_tempo_sections(gp_path_val)
+            if _sections and len(_sections) >= 2:
+                result["gp_sections"] = [
+                    {"gp_time": round(t, 4), "bpm": round(bpm, 2)}
+                    for t, bpm in _sections
+                ]
+
         try:
             cache_file.write_text(json.dumps(result))
         except OSError:
