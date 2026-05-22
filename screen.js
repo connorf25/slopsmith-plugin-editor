@@ -3,6 +3,21 @@
 (function () {
 'use strict';
 
+// align-warp.js exposes warpTabToAudioBeats / findFirstDownbeat / computeDriftSummary
+// on window via a UMD-lite shim. It can't be loaded via a <script> in screen.html
+// because the host injects plugin screens via innerHTML, which leaves embedded
+// <script> tags inert. Load it dynamically here; await _alignWarpReady before
+// using the symbols.
+const _alignWarpReady = (typeof window.warpTabToAudioBeats === 'function')
+    ? Promise.resolve()
+    : new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = '/api/plugins/editor/static/align-warp.js';
+        s.onload = () => resolve();
+        s.onerror = (e) => reject(e);
+        document.head.appendChild(s);
+    });
+
 // ════════════════════════════════════════════════════════════════════
 // Constants
 // ════════════════════════════════════════════════════════════════════
@@ -4898,6 +4913,13 @@ window.editorAutoAlign = async () => {
     const dlg = document.getElementById('editor-align-dialog');
     dlg.classList.remove('hidden');
     showAlignSection('loading');
+
+    try {
+        await _alignWarpReady;
+    } catch (e) {
+        showAlignError('script_load_failed', 'Could not load align-warp.js: ' + String(e));
+        return;
+    }
 
     if (alignState.detection) {
         // Cached in memory — just show body.
