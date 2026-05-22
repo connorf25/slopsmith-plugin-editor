@@ -5039,20 +5039,34 @@ window.editorAlignAutoPickDownbeat = () => {
 
 window.editorAlignApply = () => {
     if (!alignState.detection) return;
-    const warped = warpTabToAudioBeats({
+
+    // Compute warped beats and sections (shared across arrangements).
+    const beatWarp = warpTabToAudioBeats({
         tabBeats: S.beats,
-        notes: notes(),  // current arrangement's notes — placeholder; Task 15 fixes per-arrangement
+        notes: [],
         sections: S.sections,
         detectedBeats: alignState.detection.beats,
         k: alignState.firstBeatK,
         mode: alignState.mismatchMode,
     });
-    // Build newNotesByArr for the AutoAlignCmd. (Task 15 expands this.)
-    const newNotesByArr = S.arrangements.map(() => warped.notes);
-    S.history.exec(new AutoAlignCmd(warped.beats, newNotesByArr, warped.sections));
+
+    // Per-arrangement, warp that arrangement's notes against the same beat grid.
+    const newNotesByArr = S.arrangements.map(arr => {
+        const w = warpTabToAudioBeats({
+            tabBeats: S.beats,
+            notes: arr.notes,
+            sections: [],
+            detectedBeats: alignState.detection.beats,
+            k: alignState.firstBeatK,
+            mode: alignState.mismatchMode,
+        });
+        return w.notes;
+    });
+
+    S.history.exec(new AutoAlignCmd(beatWarp.beats, newNotesByArr, beatWarp.sections));
     document.getElementById('editor-align-dialog').classList.add('hidden');
     draw();
-    setStatus(`Auto-aligned to ${warped.beats.length} audio beats`);
+    setStatus(`Auto-aligned to ${beatWarp.beats.length} audio beats`);
 };
 
 function drawAlignPreview() {
