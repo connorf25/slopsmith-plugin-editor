@@ -4996,6 +4996,8 @@ function renderAlignBody() {
     }
 
     updateAlignDrift();
+    drawAlignPreview();
+    attachAlignCanvasListener();
 }
 
 function updateAlignDrift() {
@@ -5018,11 +5020,13 @@ window.editorAlignSetFirstBeat = (val) => {
     if (!isFinite(v) || v < 1) return;
     alignState.firstBeatK = v - 1;
     updateAlignDrift();
+    drawAlignPreview();
 };
 
 window.editorAlignSetMismatchMode = (mode) => {
     alignState.mismatchMode = mode;
     updateAlignDrift();
+    drawAlignPreview();
 };
 
 window.editorAlignAutoPickDownbeat = () => {
@@ -5030,6 +5034,7 @@ window.editorAlignAutoPickDownbeat = () => {
     alignState.firstBeatK = findFirstDownbeat(alignState.detection.beats, S.offset || 0);
     document.getElementById('editor-align-first-beat').value = alignState.firstBeatK + 1;
     updateAlignDrift();
+    drawAlignPreview();
 };
 
 window.editorAlignApply = () => {
@@ -5049,5 +5054,98 @@ window.editorAlignApply = () => {
     draw();
     setStatus(`Auto-aligned to ${warped.beats.length} audio beats`);
 };
+
+function drawAlignPreview() {
+    const canvas = document.getElementById('editor-align-preview');
+    if (!canvas || !alignState.detection || !S.audioBuffer) return;
+
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, w, h);
+
+    // Window around the picked correspondence: 5 seconds before + after.
+    const pickedAudioBeat = alignState.detection.beats[alignState.firstBeatK];
+    const center = pickedAudioBeat ? pickedAudioBeat.time : 0;
+    const window = 5.0;
+    const t0 = Math.max(0, center - window / 2);
+    const t1 = t0 + window;
+
+    // Waveform
+    const data = S.audioBuffer.getChannelData(0);
+    const sr = S.audioBuffer.sampleRate;
+    const s0 = Math.floor(t0 * sr);
+    const s1 = Math.min(data.length, Math.floor(t1 * sr));
+    const samplesPerPx = Math.max(1, Math.floor((s1 - s0) / w));
+    ctx.fillStyle = '#374151';
+    for (let x = 0; x < w; x++) {
+        let max = 0;
+        const start = s0 + x * samplesPerPx;
+        const end = Math.min(s1, start + samplesPerPx);
+        for (let i = start; i < end; i++) {
+            const v = Math.abs(data[i]);
+            if (v > max) max = v;
+        }
+        const bar = max * (h / 2) * 0.9;
+        ctx.fillRect(x, h / 2 - bar, 1, bar * 2);
+    }
+
+    // Detected beats overlay
+    for (let i = 0; i < alignState.detection.beats.length; i++) {
+        const b = alignState.detection.beats[i];
+        if (b.time < t0 || b.time > t1) continue;
+        const x = ((b.time - t0) / window) * w;
+        ctx.strokeStyle = b.downbeat ? '#fbbf24' : '#6b7280';
+        ctx.lineWidth = b.downbeat ? 2 : 1;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+    }
+
+    // GP5 beat-1 marker = picked audio beat (rendered last so it's on top)
+    if (pickedAudioBeat && pickedAudioBeat.time >= t0 && pickedAudioBeat.time <= t1) {
+        const x = ((pickedAudioBeat.time - t0) / window) * w;
+        ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+        ctx.fillStyle = '#10b981';
+        ctx.font = '10px sans-serif';
+        ctx.fillText('Tab beat 1', x + 4, 12);
+    }
+}
+
+let alignCanvasListenerAttached = false;
+
+function attachAlignCanvasListener() {
+    if (alignCanvasListenerAttached) return;
+    const canvas = document.getElementById('editor-align-preview');
+    if (!canvas) return;
+    canvas.addEventListener('click', (e) => {
+        if (!alignState.detection || !S.audioBuffer) return;
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const pickedAudioBeat = alignState.detection.beats[alignState.firstBeatK];
+        const center = pickedAudioBeat ? pickedAudioBeat.time : 0;
+        const win = 5.0;
+        const t0 = Math.max(0, center - win / 2);
+        const clickTime = t0 + (x / canvas.width) * win;
+        // Find nearest detected beat to clickTime
+        let bestIdx = 0, bestDist = Infinity;
+        for (let i = 0; i < alignState.detection.beats.length; i++) {
+            const d = Math.abs(alignState.detection.beats[i].time - clickTime);
+            if (d < bestDist) { bestDist = d; bestIdx = i; }
+        }
+        alignState.firstBeatK = bestIdx;
+        document.getElementById('editor-align-first-beat').value = bestIdx + 1;
+        updateAlignDrift();
+        drawAlignPreview();
+    });
+    alignCanvasListenerAttached = true;
+}
 
 })();
