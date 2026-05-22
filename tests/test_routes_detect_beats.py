@@ -8,7 +8,7 @@ def test_returns_503_when_provider_not_installed(client, session_dir):
     with a copyable install_hint — never a 500 or unhandled exception."""
     response = client.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": False},
+        json={"session_id": "test_session", "force": False},
     )
     assert response.status_code == 503
     body = response.json()
@@ -22,7 +22,7 @@ def test_happy_path_with_provider(client_with_provider, session_dir):
     returns the provider's response verbatim."""
     response = client_with_provider.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": False},
+        json={"session_id": "test_session", "force": False},
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -37,7 +37,7 @@ def test_cache_hit_on_repeat_call(client_with_provider, session_dir, monkeypatch
     re-invoke the provider."""
     r1 = client_with_provider.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": False},
+        json={"session_id": "test_session", "force": False},
     )
     assert r1.status_code == 200
     cache_file = session_dir / "beats_detected.json"
@@ -56,7 +56,7 @@ def test_cache_hit_on_repeat_call(client_with_provider, session_dir, monkeypatch
 
     r2 = client_with_provider.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": False},
+        json={"session_id": "test_session", "force": False},
     )
     assert r2.status_code == 200
     assert r2.json()["detector"] == "from_cache"
@@ -72,7 +72,7 @@ def test_force_bypasses_cache(client_with_provider, session_dir):
 
     r = client_with_provider.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": True},
+        json={"session_id": "test_session", "force": True},
     )
     assert r.status_code == 200
     assert r.json()["detector"] == "fake"
@@ -93,7 +93,7 @@ def test_cache_invalidated_when_audio_newer(client_with_provider, session_dir):
 
     r = client_with_provider.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": False},
+        json={"session_id": "test_session", "force": False},
     )
     assert r.status_code == 200
     assert r.json()["detector"] == "fake"  # cache was bypassed
@@ -108,7 +108,7 @@ def test_provider_5xx_becomes_502(app_factory, session_dir):
 
     r = client.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": True},
+        json={"session_id": "test_session", "force": True},
     )
     assert r.status_code == 502
     assert r.json()["error"] == "detection_failed"
@@ -126,7 +126,7 @@ def test_provider_returns_empty_beats_is_200(app_factory, session_dir):
 
     r = client.post(
         "/api/plugins/editor/detect-beats",
-        json={"session": str(session_dir), "force": True},
+        json={"session_id": "test_session", "force": True},
     )
     assert r.status_code == 200
     assert r.json()["beats"] == []

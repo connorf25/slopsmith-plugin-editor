@@ -84,6 +84,17 @@ def app_factory(tmp_path):
         (tmp_path / "dlc").mkdir(exist_ok=True)
 
         editor_setup(app, context)
+
+        # Register a test session_id → tmp_path mapping so route can look it up.
+        import routes
+        if routes._sessions is not None:
+            routes._sessions["test_session"] = {
+                "dir": str(tmp_path),
+                "audio_file": str(tmp_path / "audio.wav"),
+                "filename": "test",
+                "song_data": None,
+            }
+
         return app
 
     return _make

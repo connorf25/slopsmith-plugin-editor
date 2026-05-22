@@ -3034,24 +3034,30 @@ def setup(app, context):
                 status_code=503,
             )
 
-        session_str = data.get("session", "")
+        session_id = data.get("session_id", "")
         force = bool(data.get("force", False))
 
-        session_path = Path(session_str)
-        if not session_path.is_dir():
+        session = sessions.get(session_id)
+        if session is None:
             return JSONResponse(
-                {"error": "audio_missing", "detail": f"session dir not found: {session_str}"},
+                {"error": "session_not_found", "detail": f"unknown session_id: {session_id}"},
                 status_code=404,
             )
 
-        # Find the audio file: any of audio.wav/mp3/ogg/m4a/flac in the session dir.
-        audio_path = None
-        for ext in ("wav", "mp3", "ogg", "m4a", "flac"):
-            candidate = session_path / f"audio.{ext}"
-            if candidate.exists():
-                audio_path = candidate
-                break
-        if audio_path is None:
+        session_path = Path(session.get("dir", ""))
+        audio_file = session.get("audio_file")
+        if audio_file:
+            audio_path = Path(audio_file)
+        else:
+            # Fallback: scan session dir for audio.*
+            audio_path = None
+            for ext in ("wav", "mp3", "ogg", "m4a", "flac"):
+                candidate = session_path / f"audio.{ext}"
+                if candidate.exists():
+                    audio_path = candidate
+                    break
+
+        if audio_path is None or not audio_path.exists():
             return JSONResponse(
                 {"error": "audio_missing", "detail": "no audio file in session"},
                 status_code=404,
