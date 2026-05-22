@@ -4889,9 +4889,165 @@ async function discoverAutoAlignProvider() {
     }
 }
 
-window.editorAutoAlign = () => {
-    // Stub for now — Task 13 wires the dialog.
-    console.log('editorAutoAlign clicked', alignState);
+window.editorAutoAlign = async () => {
+    const dlg = document.getElementById('editor-align-dialog');
+    dlg.classList.remove('hidden');
+    showAlignSection('loading');
+
+    if (alignState.detection) {
+        // Cached in memory — just show body.
+        renderAlignBody();
+        return;
+    }
+    await fetchDetection({ force: false });
+};
+
+window.editorAlignCancel = () => {
+    document.getElementById('editor-align-dialog').classList.add('hidden');
+};
+
+window.editorAlignRedetect = async () => {
+    showAlignSection('loading');
+    alignState.detection = null;
+    await fetchDetection({ force: true });
+};
+
+window.editorAlignRetry = window.editorAlignRedetect;
+
+async function fetchDetection({ force }) {
+    if (!S.sessionId) {
+        showAlignError('no_session', 'Load a session first.');
+        return;
+    }
+
+    let elapsed = 0;
+    const elapsedEl = document.getElementById('editor-align-elapsed');
+    const ticker = setInterval(() => { elapsed++; if (elapsedEl) elapsedEl.textContent = elapsed; }, 1000);
+
+    // Spec FR7: 120 s timeout on detection.
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), 120000);
+
+    try {
+        const resp = await fetch('/api/plugins/editor/detect-beats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: S.sessionId, force }),
+            signal: ctrl.signal,
+        });
+        clearInterval(ticker);
+        clearTimeout(timeoutId);
+
+        if (!resp.ok) {
+            const body = await resp.json().catch(() => ({}));
+            showAlignError(body.error || 'unknown', body.install_hint || body.detail || resp.statusText);
+            return;
+        }
+        alignState.detection = await resp.json();
+        alignState.firstBeatK = findFirstDownbeat(alignState.detection.beats, S.offset || 0);
+        alignState.pollAttempts = 0;
+        renderAlignBody();
+    } catch (e) {
+        clearInterval(ticker);
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') {
+            showAlignError('detection_timeout', 'Detection took longer than 120 seconds. Try Re-detect.');
+        } else {
+            showAlignError('fetch_failed', String(e));
+        }
+    }
+}
+
+function showAlignSection(which) {
+    for (const id of ['editor-align-loading', 'editor-align-error', 'editor-align-body']) {
+        document.getElementById(id).classList.add('hidden');
+    }
+    document.getElementById('editor-align-' + which).classList.remove('hidden');
+}
+
+function showAlignError(code, hint) {
+    showAlignSection('error');
+    document.getElementById('editor-align-error-code').textContent = code;
+    document.getElementById('editor-align-error-hint').textContent = hint || '';
+}
+
+function renderAlignBody() {
+    showAlignSection('body');
+    const d = alignState.detection;
+    const M = d.beats.length;
+    const D = d.beats.filter(b => b.downbeat).length;
+    document.getElementById('editor-align-stats-detected').textContent =
+        `${M} beats detected · ${D} downbeats · ${d.mean_bpm.toFixed(1)} BPM avg`;
+    const N = S.beats.length;
+    const measures = S.beats.filter(b => b.measure > 0).length;
+    document.getElementById('editor-align-stats-tab').textContent =
+        `Tab has: ${N} beats · ${measures} measures`;
+    document.getElementById('editor-align-first-beat').value = alignState.firstBeatK + 1;
+
+    // Mismatch UI
+    const mismatch = M !== N + alignState.firstBeatK;
+    const ms = document.getElementById('editor-align-mismatch');
+    if (mismatch) {
+        ms.classList.remove('hidden');
+        document.getElementById('editor-align-mismatch-detail').textContent =
+            `audio ${M} vs tab ${N}+${alignState.firstBeatK}`;
+    } else {
+        ms.classList.add('hidden');
+    }
+
+    updateAlignDrift();
+}
+
+function updateAlignDrift() {
+    if (!alignState.detection) return;
+    // Compute the proposed new beats lazily for the drift summary.
+    const warped = warpTabToAudioBeats({
+        tabBeats: S.beats,
+        notes: [], sections: [],
+        detectedBeats: alignState.detection.beats,
+        k: alignState.firstBeatK,
+        mode: alignState.mismatchMode,
+    });
+    const summary = computeDriftSummary(S.beats, warped.beats);
+    document.getElementById('editor-align-drift').textContent =
+        `Max shift ±${summary.maxShiftMs}ms · mean shift ${summary.meanShiftMs}ms`;
+}
+
+window.editorAlignSetFirstBeat = (val) => {
+    const v = parseInt(val, 10);
+    if (!isFinite(v) || v < 1) return;
+    alignState.firstBeatK = v - 1;
+    updateAlignDrift();
+};
+
+window.editorAlignSetMismatchMode = (mode) => {
+    alignState.mismatchMode = mode;
+    updateAlignDrift();
+};
+
+window.editorAlignAutoPickDownbeat = () => {
+    if (!alignState.detection) return;
+    alignState.firstBeatK = findFirstDownbeat(alignState.detection.beats, S.offset || 0);
+    document.getElementById('editor-align-first-beat').value = alignState.firstBeatK + 1;
+    updateAlignDrift();
+};
+
+window.editorAlignApply = () => {
+    if (!alignState.detection) return;
+    const warped = warpTabToAudioBeats({
+        tabBeats: S.beats,
+        notes: notes(),  // current arrangement's notes — placeholder; Task 15 fixes per-arrangement
+        sections: S.sections,
+        detectedBeats: alignState.detection.beats,
+        k: alignState.firstBeatK,
+        mode: alignState.mismatchMode,
+    });
+    // Build newNotesByArr for the AutoAlignCmd. (Task 15 expands this.)
+    const newNotesByArr = S.arrangements.map(() => warped.notes);
+    S.history.exec(new AutoAlignCmd(warped.beats, newNotesByArr, warped.sections));
+    document.getElementById('editor-align-dialog').classList.add('hidden');
+    draw();
+    setStatus(`Auto-aligned to ${warped.beats.length} audio beats`);
 };
 
 })();

@@ -457,6 +457,67 @@
     </div>
 </div>
 
+<!-- Auto-Align dialog -->
+<div id="editor-align-dialog" class="hidden absolute inset-0 z-50 flex items-center justify-center" style="background:rgba(0,0,0,0.7)">
+    <div class="bg-dark-800 border border-gray-700 rounded-lg p-4 w-[640px] max-w-[90vw] max-h-[90vh] overflow-auto">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm font-semibold text-gray-200">Auto-Align to Audio Beats</h2>
+            <button onclick="editorAlignCancel()" class="text-gray-500 hover:text-white">&times;</button>
+        </div>
+
+        <div id="editor-align-loading" class="py-8 text-center text-gray-400 text-sm">
+            <div class="inline-block w-4 h-4 border-2 border-gray-500 border-t-accent rounded-full animate-spin mr-2"></div>
+            Detecting beats… <span id="editor-align-elapsed">0</span>s
+        </div>
+
+        <div id="editor-align-error" class="hidden py-4 text-sm">
+            <div class="text-red-400 mb-2"><span id="editor-align-error-code"></span></div>
+            <pre id="editor-align-error-hint" class="bg-dark-900 border border-gray-700 rounded p-2 text-xs text-gray-300 whitespace-pre-wrap"></pre>
+            <button onclick="editorAlignRetry()"
+                class="mt-3 px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs">Retry</button>
+        </div>
+
+        <div id="editor-align-body" class="hidden">
+            <div class="text-xs text-gray-400 mb-2">
+                <span id="editor-align-stats-detected"></span><br>
+                <span id="editor-align-stats-tab"></span>
+            </div>
+
+            <canvas id="editor-align-preview" width="600" height="120"
+                class="w-full bg-dark-900 border border-gray-700 rounded mb-3"></canvas>
+
+            <div class="flex items-center gap-2 mb-3 text-xs">
+                <span class="text-gray-400">GP5 beat 1 = audio beat</span>
+                <input type="number" id="editor-align-first-beat" min="1" value="1"
+                    onchange="editorAlignSetFirstBeat(this.value)"
+                    class="w-16 bg-dark-700 border border-gray-700 rounded px-1 py-0.5 text-xs text-gray-300 text-center">
+                <button onclick="editorAlignAutoPickDownbeat()"
+                    class="px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-xs">Auto-pick first downbeat</button>
+            </div>
+
+            <div id="editor-align-mismatch" class="hidden mb-3 text-xs">
+                <div class="text-gray-400 mb-1">Count mismatch:
+                    <span id="editor-align-mismatch-detail" class="text-gray-300"></span>
+                </div>
+                <label class="mr-3"><input type="radio" name="align-mode" value="truncate" checked
+                    onchange="editorAlignSetMismatchMode('truncate')"> Truncate</label>
+                <label><input type="radio" name="align-mode" value="extend"
+                    onchange="editorAlignSetMismatchMode('extend')"> Extend tab tail</label>
+            </div>
+
+            <div class="text-xs text-gray-500 mb-3">
+                <span id="editor-align-drift"></span>
+            </div>
+
+            <div class="flex justify-end gap-2">
+                <button onclick="editorAlignCancel()" class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs">Cancel</button>
+                <button onclick="editorAlignRedetect()" class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs">Re-detect</button>
+                <button onclick="editorAlignApply()" class="px-3 py-1 bg-accent hover:bg-accent-light rounded text-xs">Apply ✓</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Add note dialog -->
 <div id="editor-add-note-dialog" class="hidden absolute z-50 bg-dark-700 border border-gray-700 rounded-lg shadow-xl p-3 w-48">
     <div class="text-xs text-gray-400 mb-2">Add Note</div>
