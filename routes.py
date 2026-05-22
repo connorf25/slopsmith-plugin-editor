@@ -3058,8 +3058,32 @@ def setup(app, context):
                     break
 
         if audio_path is None or not audio_path.exists():
+            # Diagnostic: surface enough state so the user can see what went
+            # wrong (audio_file None vs path-not-on-disk vs session_dir gone).
+            try:
+                dir_listing = (
+                    sorted(p.name for p in session_path.iterdir())
+                    if session_path.is_dir() else None
+                )
+            except OSError:
+                dir_listing = None
             return JSONResponse(
-                {"error": "audio_missing", "detail": "no audio file in session"},
+                {
+                    "error": "audio_missing",
+                    "detail": "no audio file in session",
+                    "diagnostic": {
+                        "session_dir": str(session_path),
+                        "session_dir_exists": session_path.is_dir(),
+                        "audio_file_value": audio_file,
+                        "audio_file_exists": (
+                            audio_path.exists() if audio_path is not None else None
+                        ),
+                        "session_keys": sorted(session.keys()),
+                        "session_format": session.get("format"),
+                        "create_mode": session.get("create_mode", False),
+                        "dir_listing": dir_listing,
+                    },
+                },
                 status_code=404,
             )
 
