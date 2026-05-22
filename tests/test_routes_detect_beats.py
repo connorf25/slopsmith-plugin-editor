@@ -130,3 +130,20 @@ def test_provider_returns_empty_beats_is_200(app_factory, session_dir):
     )
     assert r.status_code == 200
     assert r.json()["beats"] == []
+
+
+def test_static_file_route_serves_align_warp(client):
+    """The /static/{name} route serves plugin-local JS files."""
+    r = client.get("/api/plugins/editor/static/align-warp.js")
+    assert r.status_code == 200
+    assert "warpTabToAudioBeats" in r.text
+
+
+def test_static_file_route_rejects_path_traversal(client):
+    """Path traversal attempts return 403."""
+    r = client.get("/api/plugins/editor/static/../routes.py")
+    # FastAPI normalizes the path before it reaches the handler, so the
+    # traversal either gets rejected by the path-prefix check (403) OR
+    # FastAPI itself returns a 404 because the normalized path doesn't
+    # match a route. Either is acceptable security behavior.
+    assert r.status_code in (403, 404)

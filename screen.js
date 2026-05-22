@@ -2089,6 +2089,9 @@ async function loadCDLC(filename) {
 
         draw();
         setStatus('Loaded: ' + S.artist + ' — ' + S.title);
+
+        // Probe for the optional auto-align provider plugin. Fire-and-forget.
+        discoverAutoAlignProvider();
     } catch (e) {
         setStatus('Load failed: ' + e.message);
     }
@@ -4839,5 +4842,56 @@ if (document.getElementById('editor-canvas')) {
         }
     }, 100);
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Auto-Align: provider discovery + dialog wiring
+// ════════════════════════════════════════════════════════════════════
+
+let alignState = {
+    providerHealthy: false,
+    detection: null,           // last detection result for this session
+    firstBeatK: 0,             // 0-indexed audio beat that corresponds to tab beat 0
+    mismatchMode: 'truncate',  // 'truncate' | 'extend'
+    pollAttempts: 0,
+};
+
+async function discoverAutoAlignProvider() {
+    const btn = document.getElementById('editor-align-btn');
+    if (!btn) return;
+
+    // Hide by default — only reveal when ALL gates pass (spec FR9 + FR2).
+    btn.classList.add('hidden');
+    alignState.providerHealthy = false;
+
+    // Pre-gate: audio + at least 2 beats must be loaded.
+    if (!S.audioBuffer || !S.beats || S.beats.length < 2) return;
+
+    try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 2000);
+        const resp = await fetch('/api/plugins/auto-align/health', { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!resp.ok) return;
+        const body = await resp.json();
+        if (body.model_loaded === true) {
+            btn.classList.remove('hidden');
+            alignState.providerHealthy = true;
+            return;
+        }
+        // Provider is warming up — re-poll up to 3 times (spec FR3).
+        if (alignState.pollAttempts < 3) {
+            alignState.pollAttempts++;
+            setTimeout(discoverAutoAlignProvider, 5000);
+        }
+    } catch (_) {
+        // 404, timeout, or connection refused — provider not installed.
+        // Button stays hidden; nothing else to do.
+    }
+}
+
+window.editorAutoAlign = () => {
+    // Stub for now — Task 13 wires the dialog.
+    console.log('editorAutoAlign clicked', alignState);
+};
 
 })();

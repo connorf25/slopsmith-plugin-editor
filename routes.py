@@ -271,6 +271,17 @@ def setup(app, context):
             return JSONResponse({"error": "not found"}, status_code=404)
         return FileResponse(candidate)
 
+    @app.get("/api/plugins/editor/static/{name:path}")
+    def get_static_file(name: str):
+        # Serve plugin-local JS files (align-warp.js, etc.).
+        plugin_dir = Path(__file__).parent
+        target = (plugin_dir / name).resolve()
+        if not str(target).startswith(str(plugin_dir.resolve())):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        if not target.exists() or not target.is_file():
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return FileResponse(target)
+
     # ── List available CDLC files ────────────────────────────────────────
 
     @app.get("/api/plugins/editor/songs")

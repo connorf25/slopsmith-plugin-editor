@@ -1,3 +1,4 @@
+<script src="/api/plugins/editor/static/align-warp.js"></script>
 <div class="flex flex-col h-screen pt-16 bg-dark-900 text-white overflow-hidden">
 
     <!-- Top bar: back + song info -->
@@ -64,6 +65,9 @@
             value="120" onchange="editorSetBPM(this.value)" title="Change tab tempo — rescales all notes and beats">
         <!-- Tempo sync -->
         <button id="editor-sync-btn" onclick="editorSyncTempo()" class="px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-xs hidden" title="Match tab tempo to audio">Sync</button>
+        <button id="editor-align-btn" onclick="editorAutoAlign()"
+            class="px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-xs hidden"
+            title="Auto-align tab beats to detected audio beats">⇋ Align</button>
 
         <div class="h-4 w-px bg-gray-700"></div>
 
