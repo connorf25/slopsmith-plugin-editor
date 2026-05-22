@@ -92,12 +92,28 @@
         return { beats: newBeats, notes: newNotes, sections: newSections };
     }
 
-    function findFirstDownbeat(_detectedBeats, _offsetSec) {
-        throw new Error('not implemented');
+    function findFirstDownbeat(detectedBeats, offsetSec) {
+        for (let i = 0; i < detectedBeats.length; i++) {
+            if (detectedBeats[i].downbeat && detectedBeats[i].time >= (offsetSec || 0)) {
+                return i;
+            }
+        }
+        return 0;
     }
 
-    function computeDriftSummary(_oldBeats, _newBeats) {
-        throw new Error('not implemented');
+    function computeDriftSummary(oldBeats, newBeats) {
+        const len = Math.min(oldBeats.length, newBeats.length);
+        if (len === 0) return { maxShiftMs: 0, meanShiftMs: 0 };
+        let max = 0, sum = 0;
+        for (let i = 0; i < len; i++) {
+            const d = Math.abs(newBeats[i].time - oldBeats[i].time);
+            if (d > max) max = d;
+            sum += d;
+        }
+        return {
+            maxShiftMs: Math.round(max * 1000),
+            meanShiftMs: Math.round((sum / len) * 1000),
+        };
     }
 
     return { warpTabToAudioBeats, findFirstDownbeat, computeDriftSummary };

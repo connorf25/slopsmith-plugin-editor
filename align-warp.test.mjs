@@ -127,3 +127,30 @@ test('section snaps to nearest tab beat then takes warped position', () => {
     });
     assert.equal(r.sections[0].start_time, 0.7);
 });
+
+import { createRequire as _cr } from 'node:module';
+const _r = _cr(import.meta.url);
+const { findFirstDownbeat, computeDriftSummary } = _r('./align-warp.js');
+
+test('findFirstDownbeat: returns index of first downbeat >= offset', () => {
+    const beats = [
+        { time: 0.1, downbeat: false }, { time: 0.5, downbeat: true },
+        { time: 1.0, downbeat: false }, { time: 1.5, downbeat: true },
+    ];
+    assert.equal(findFirstDownbeat(beats, 0.0), 1);
+    assert.equal(findFirstDownbeat(beats, 0.6), 3);
+});
+
+test('findFirstDownbeat: no downbeats → returns 0', () => {
+    const beats = [{ time: 0.5, downbeat: false }];
+    assert.equal(findFirstDownbeat(beats, 0.0), 0);
+});
+
+test('computeDriftSummary: returns max and mean absolute shift in ms', () => {
+    const oldBeats = [{ time: 0 }, { time: 1.0 }, { time: 2.0 }];
+    const newBeats = [{ time: 0 }, { time: 1.1 }, { time: 1.95 }];
+    const s = computeDriftSummary(oldBeats, newBeats);
+    // shifts: 0, +100ms, -50ms → max 100, mean 50
+    assert.equal(s.maxShiftMs, 100);
+    assert.equal(s.meanShiftMs, 50);
+});
