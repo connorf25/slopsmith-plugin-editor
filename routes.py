@@ -3036,6 +3036,7 @@ def setup(app, context):
 
         session_id = data.get("session_id", "")
         force = bool(data.get("force", False))
+        audio_url_hint = (data.get("audio_url") or "").strip()
 
         session = sessions.get(session_id)
         if session is None:
@@ -3046,11 +3047,18 @@ def setup(app, context):
 
         session_path = Path(session.get("dir", ""))
         audio_file = session.get("audio_file")
+        audio_path = None
         if audio_file:
             audio_path = Path(audio_file)
-        else:
-            # Fallback: scan session dir for audio.*
-            audio_path = None
+        elif audio_url_hint:
+            # Create-mode sessions don't have audio_file populated until Build.
+            # The frontend knows the audio_url (it's what was passed to loadAudio
+            # for playback); resolve it back to a filesystem path.
+            resolved = _resolve_storage_url(audio_url_hint)
+            if resolved is not None and resolved.exists():
+                audio_path = resolved
+        if audio_path is None or not audio_path.exists():
+            # Last-ditch fallback: scan session dir for audio.*
             for ext in ("wav", "mp3", "ogg", "m4a", "flac"):
                 candidate = session_path / f"audio.{ext}"
                 if candidate.exists():
@@ -3075,6 +3083,7 @@ def setup(app, context):
                         "session_dir": str(session_path),
                         "session_dir_exists": session_path.is_dir(),
                         "audio_file_value": audio_file,
+                        "audio_url_hint": audio_url_hint,
                         "audio_file_exists": (
                             audio_path.exists() if audio_path is not None else None
                         ),

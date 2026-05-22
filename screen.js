@@ -2083,6 +2083,7 @@ async function loadCDLC(filename) {
         updateBPMDisplay();
 
         // Load audio
+        S.audioUrl = data.audio_url || null;
         if (data.audio_url) {
             await loadAudio(data.audio_url);
         }
@@ -3064,9 +3065,13 @@ window.editorDoCreate = async () => {
         updateTimeDisplay();
         updateBPMDisplay();
 
+        S.audioUrl = data.audio_url || null;
         if (data.audio_url) await loadAudio(data.audio_url);
         draw();
         setStatus('Imported — edit notes then click Build CDLC');
+        // Reveal the ⇋ Align button if the provider plugin is installed.
+        // (loadCDLC has its own discovery call; create-mode needs its own.)
+        if (typeof discoverAutoAlignProvider === 'function') discoverAutoAlignProvider();
     } catch (e) {
         status.textContent = 'Import failed: ' + e.message;
         btn.disabled = false;
@@ -4932,7 +4937,14 @@ async function fetchDetection({ force }) {
         const resp = await fetch('/api/plugins/editor/detect-beats', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: S.sessionId, force }),
+            body: JSON.stringify({
+                session_id: S.sessionId,
+                force,
+                // Forward audio_url so create-mode sessions (where
+                // session["audio_file"] is None until Build) can still
+                // resolve the audio server-side.
+                audio_url: S.audioUrl || '',
+            }),
             signal: ctrl.signal,
         });
         clearInterval(ticker);
