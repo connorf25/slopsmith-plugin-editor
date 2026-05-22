@@ -3071,14 +3071,27 @@ def setup(app, context):
                 status_code=502,
             )
 
+        # If provider returned a JSONResponse (typically an error), relay its
+        # status by wrapping in our own JSONResponse with status 502 and the
+        # provider's body content as `detail`.
+        if hasattr(result, "body"):
+            try:
+                provider_body = json.loads(result.body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                provider_body = {"raw": str(result.body)}
+            return JSONResponse(
+                {
+                    "error": "detection_failed",
+                    "detail": provider_body,
+                    "upstream_status": getattr(result, "status_code", None),
+                },
+                status_code=502,
+            )
+
         # ----- Cache write -----
         try:
-            if not hasattr(result, "body"):  # plain dict; we can serialize
-                cache_file.write_text(json.dumps(result))
+            cache_file.write_text(json.dumps(result))
         except OSError:
-            pass  # cache write failure is non-fatal
+            pass
 
-        # Provider can return either a dict or a JSONResponse.
-        if hasattr(result, "body"):
-            return result
         return result

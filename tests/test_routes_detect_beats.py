@@ -97,3 +97,36 @@ def test_cache_invalidated_when_audio_newer(client_with_provider, session_dir):
     )
     assert r.status_code == 200
     assert r.json()["detector"] == "fake"  # cache was bypassed
+
+
+def test_provider_5xx_becomes_502(app_factory, session_dir):
+    """If provider returns 500/503/etc, editor returns 502 detection_failed
+    (relayed body in detail when available)."""
+    from fastapi.testclient import TestClient
+    app = app_factory(with_provider=True, provider_status=500)
+    client = TestClient(app)
+
+    r = client.post(
+        "/api/plugins/editor/detect-beats",
+        json={"session": str(session_dir), "force": True},
+    )
+    assert r.status_code == 502
+    assert r.json()["error"] == "detection_failed"
+
+
+def test_provider_returns_empty_beats_is_200(app_factory, session_dir):
+    """Empty `beats` list is a valid 200 response."""
+    from fastapi.testclient import TestClient
+    empty_response = {
+        "beats": [], "mean_bpm": 0.0, "bpm_curve": [],
+        "audio_duration": 3.0, "detector": "fake", "detector_version": "0.0.0",
+    }
+    app = app_factory(with_provider=True, provider_response=empty_response)
+    client = TestClient(app)
+
+    r = client.post(
+        "/api/plugins/editor/detect-beats",
+        json={"session": str(session_dir), "force": True},
+    )
+    assert r.status_code == 200
+    assert r.json()["beats"] == []
