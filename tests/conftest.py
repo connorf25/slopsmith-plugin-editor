@@ -1,21 +1,20 @@
 """Test fixtures for the auto-align editor-side feature.
 
 Each test gets a fresh FastAPI app with the editor's routes mounted.
-A `fake_provider` fixture optionally mounts a stub auto-align provider
-on the same app so we can exercise the forwarding logic end-to-end
-without depending on the real provider plugin.
+The `client_with_provider` fixture and `app_factory(with_provider=True)`
+mount a stub auto-align provider on the same app so we can exercise the
+forwarding logic end-to-end without depending on the real provider plugin.
 """
 import io
-import json
+import os
 import sys
 import wave
 from pathlib import Path
-import tempfile
-import shutil
-import os
 
-sys.path.insert(0, str(Path("/Users/connorforbes/Documents/GitHub/slopsmith")))
-sys.path.insert(0, str(Path("/Users/connorforbes/Documents/GitHub/slopsmith/lib")))
+_default_slopsmith = Path(__file__).resolve().parent.parent.parent / "slopsmith"
+_slopsmith = Path(os.environ.get("SLOPSMITH_PATH", _default_slopsmith))
+sys.path.insert(0, str(_slopsmith))
+sys.path.insert(0, str(_slopsmith / "lib"))
 
 import pytest
 from fastapi import FastAPI, UploadFile, File
@@ -127,9 +126,10 @@ def _stock_provider_response():
 
 
 def _mount_fake_provider(app, *, response, status, health_loaded):
+    from fastapi.responses import JSONResponse
+
     @app.get("/api/plugins/auto-align/health")
     async def _health():
-        from fastapi.responses import JSONResponse
         return JSONResponse(
             {"status": "ok" if health_loaded else "loading",
              "detector": "fake",
@@ -140,7 +140,6 @@ def _mount_fake_provider(app, *, response, status, health_loaded):
 
     @app.post("/api/plugins/auto-align/detect-beats")
     async def _detect(audio: UploadFile = File(...)):
-        from fastapi.responses import JSONResponse
         if status == 200:
             return response
         return JSONResponse(
