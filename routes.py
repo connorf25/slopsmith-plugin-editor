@@ -3046,6 +3046,17 @@ def setup(app, context):
                 status_code=404,
             )
 
+        # ----- Cache check -----
+        cache_file = session_path / "beats_detected.json"
+        if not force and cache_file.exists():
+            cache_mtime = cache_file.stat().st_mtime
+            audio_mtime = audio_path.stat().st_mtime
+            if cache_mtime >= audio_mtime:
+                try:
+                    return json.loads(cache_file.read_text())
+                except (OSError, json.JSONDecodeError):
+                    pass  # treat corrupt cache as miss
+
         # Call provider in-process. Build an UploadFile from the audio bytes.
         audio_bytes = audio_path.read_bytes()
         upload = UploadFile(
@@ -3059,6 +3070,13 @@ def setup(app, context):
                 {"error": "detection_failed", "detail": str(e)},
                 status_code=502,
             )
+
+        # ----- Cache write -----
+        try:
+            if not hasattr(result, "body"):  # plain dict; we can serialize
+                cache_file.write_text(json.dumps(result))
+        except OSError:
+            pass  # cache write failure is non-fatal
 
         # Provider can return either a dict or a JSONResponse.
         if hasattr(result, "body"):
